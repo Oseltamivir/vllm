@@ -119,10 +119,13 @@ def fused_allreduce_gemma_rms_norm(
 
     ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
     if ok:
-        norm_out = torch.empty_like(hidden_states)
-        # With norm_out provided, the kernel writes the new residual
-        # (all_reduce(hidden_states) + residual) into the hidden_states buffer
-        # and the normalized result into norm_out, leaving `residual` untouched.
+        # Pass norm_out=None so the kernel uses the same buffer aliasing
+        # as the compile-time AllReduceFusedAddGemmaRMSNormPattern:
+        #   norm_out ← allreduce_in  (normalized result written in place)
+        #   residual_out ← residual  (new residual written in place)
+        # The alternative (norm_out=separate buffer) triggers a different
+        # aliasing path (residual_out ← allreduce_in) inside the kernel
+        # that produces incorrect results on the MNNVL multi-node backend.
         flashinfer_trtllm_fused_allreduce_norm(
             allreduce_in=hidden_states,
             residual=residual,
@@ -134,9 +137,9 @@ def fused_allreduce_gemma_rms_norm(
             fp32_acc=True,
             max_token_num=max_token_num,
             pattern_code=_AR_RESIDUAL_RMS_NORM,
-            norm_out=norm_out,
+            norm_out=None,
         )
-        return norm_out, hidden_states
+        return hidden_states, residual
 
     # Fallback: explicit all-reduce + GemmaRMSNorm (matches the unfused model).
     reduced = tensor_model_parallel_all_reduce(hidden_states)
