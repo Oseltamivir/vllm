@@ -2177,8 +2177,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
         if self.moe.max_model_len <= 4096:
             logger.info_once(
-                "Retaining BF16 MXFP8 MoE weights for gfx94x TP decode and "
-                "prefill dispatch."
+                "Retaining BF16 MXFP8 MoE weights for profiled gfx94x "
+                "native/BF16 dispatch."
             )
         else:
             logger.info_once(

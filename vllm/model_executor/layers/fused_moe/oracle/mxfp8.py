@@ -90,7 +90,7 @@ def _select_rocm_mxfp8_backend(
         if _should_use_native_ep(config):
             logger.info_once(
                 "Using the profiled gfx94x MiniMax-M3 EP8 MXFP8 backend: "
-                "native local-route kernels with compressed-only expert weights."
+                "native local-route kernels with retained BF16 decode experts."
             )
             return Fp8MoeBackend.NATIVE_MXFP8, Mxfp8NativeTritonExperts
 
@@ -99,9 +99,8 @@ def _select_rocm_mxfp8_backend(
         )
 
         logger.info_once(
-            "Using BF16 MXFP8 emulation for gfx94x expert parallelism; the "
-            "native CDNA3 path is optimized for decode-sized TP workloads and "
-            "is slower for the large local batches reached during EP prefill."
+            "Using the profiled sparse BF16 MXFP8 path for long-context gfx94x "
+            "expert parallelism."
         )
         return Fp8MoeBackend.EMULATION, Mxfp8EmulationTritonExperts
 

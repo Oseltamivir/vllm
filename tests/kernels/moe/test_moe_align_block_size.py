@@ -266,6 +266,7 @@ def test_moe_align_block_size_with_expert_map(
         num_experts=num_experts,
         expert_map=expert_map,
         ignore_invalid_experts=True,
+        num_local_experts=len(local_experts),
     )
     golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
         torch_moe_align_block_size(
@@ -277,7 +278,18 @@ def test_moe_align_block_size_with_expert_map(
     )
 
     torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
-    torch.testing.assert_close(actual_expert_ids, golden_expert_ids, atol=0, rtol=0)
+    num_blocks = cdiv(int(golden_num_tokens.item()), block_size)
+    torch.testing.assert_close(
+        actual_expert_ids[:num_blocks],
+        golden_expert_ids[:num_blocks],
+        atol=0,
+        rtol=0,
+    )
+    expected_allocation = min(
+        m * topk * block_size,
+        m * topk + len(local_experts) * (block_size - 1),
+    )
+    assert actual_sorted_ids.numel() == expected_allocation
     _verify_expert_level_sorting(
         actual_sorted_ids,
         golden_sorted_ids,

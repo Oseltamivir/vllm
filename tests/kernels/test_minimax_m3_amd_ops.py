@@ -112,7 +112,8 @@ def test_mxfp8_gfx94x_grouped_gemm_config(
         ({}, True),
         ({"max_model_len": 10240}, True),
         ({"max_model_len": 0}, False),
-        ({"ep_size": 8}, False),
+        ({"ep_size": 8}, True),
+        ({"ep_size": 8, "max_model_len": 9472}, False),
         ({"ep_size": 4}, False),
         ({"has_shared_experts": False}, False),
         ({"experts_per_token": 8}, False),
@@ -169,6 +170,7 @@ def test_mxfp8_bf16_decode_fallback_disabled_on_gfx950(monkeypatch):
     ("overrides", "expected"),
     [
         ({"ep_size": 8}, True),
+        ({"ep_size": 8, "max_model_len": 9472}, False),
         ({}, False),
         ({"ep_size": 4}, False),
         ({"max_model_len": 0, "ep_size": 8}, False),
@@ -253,6 +255,32 @@ def test_mxfp8_bf16_only_storage_policy(max_model_len, layer_index, expected):
     )
 
     assert _should_store_bf16_only(max_model_len, layer_index) is expected
+
+
+def test_mxfp8_sparse_bf16_ep_config(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
+        _MINIMAX_M3_MI300X_EP_BF16_CONFIG,
+        _is_minimax_m3_mi300x_ep8,
+    )
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "is_fp8_fnuz",
+        classmethod(lambda cls: True),
+    )
+    config = SimpleNamespace(
+        ep_size=8,
+        has_shared_experts=True,
+        num_experts=128,
+        experts_per_token=4,
+        hidden_dim=6144,
+        intermediate_size=3072,
+        max_model_len=9472,
+    )
+
+    assert _is_minimax_m3_mi300x_ep8(config)
+    assert _MINIMAX_M3_MI300X_EP_BF16_CONFIG["BLOCK_SIZE_M"] == 16
+    assert _MINIMAX_M3_MI300X_EP_BF16_CONFIG["GROUP_SIZE_M"] == 1
 
 
 @pytest.mark.parametrize(
@@ -390,6 +418,120 @@ def _ref_swiglu(gate_up, alpha, beta, limit):
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
     return (gate * torch.sigmoid(alpha * gate) * (up + beta)).to(gate_up.dtype)
+
+
+@requires_mi3xx
+@torch.inference_mode()
+def test_bf16_gated_moe_gemm_local_routes():
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        _prepare_expert_assignment,
+        invoke_fused_moe_gated_triton_kernel,
+    )
+
+    torch.manual_seed(0)
+    T, H, inter, local_E, global_E, top_k = 8, 256, 128, 4, 8, 2
+    x = torch.randn(T, H, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    w13 = (
+        torch.randn(
+            local_E,
+            2 * inter,
+            H,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    )
+    topk_ids = torch.tensor(
+        [[0, 1], [2, 3], [4, 5], [6, 7]] * 2,
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    expert_map = torch.tensor(
+        [0, -1, 1, -1, 2, -1, 3, -1],
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "SPLIT_K": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+    sorted_ids, expert_ids, num_post = _prepare_expert_assignment(
+        topk_ids,
+        config,
+        T,
+        top_k,
+        global_E,
+        expert_map,
+        ignore_invalid_experts=True,
+        num_local_experts=local_E,
+    )
+    assert sorted_ids is not None
+    got = torch.full(
+        (T * top_k, inter),
+        torch.nan,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    invoke_fused_moe_gated_triton_kernel(
+        x,
+        w13,
+        got,
+        sorted_ids,
+        expert_ids,
+        num_post,
+        top_k,
+        config,
+        1.702,
+        1.0,
+        7.0,
+    )
+
+    for route, global_expert in enumerate(topk_ids.flatten().tolist()):
+        local_expert = int(expert_map[global_expert].item())
+        if local_expert < 0:
+            assert torch.isnan(got[route]).all()
+            continue
+        gate_up = (x[route // top_k].float() @ w13[local_expert].float().T).to(
+            torch.bfloat16
+        )
+        ref = _ref_swiglu(gate_up, 1.702, 1.0, 7.0)
+        assert _relerr(got[route], ref) < 5e-3
+
+
+@requires_mi3xx
+@torch.inference_mode()
+def test_moe_fused_sum_skips_remote_weighted_routes():
+    from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+        moe_fused_mul_sum,
+    )
+
+    torch.manual_seed(0)
+    T, top_k, H = 5, 4, 256
+    topk_ids = torch.tensor(
+        [[0, 1, 2, 3]] * T,
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    expert_map = torch.tensor([0, -1, 1, -1], device=DEVICE, dtype=torch.int32)
+    weights = torch.rand(T, top_k, device=DEVICE, dtype=torch.float32)
+    routes = torch.randn(T, top_k, H, device=DEVICE, dtype=torch.bfloat16)
+    weighted_routes = (routes.float() * weights[..., None]).to(torch.bfloat16)
+    weighted_routes[:, 1::2] = torch.nan
+
+    got = moe_fused_mul_sum(
+        weighted_routes,
+        weights,
+        topk_ids=topk_ids,
+        expert_map=expert_map,
+        apply_weights=False,
+    )
+    ref = weighted_routes[:, ::2].float().sum(dim=1).to(torch.bfloat16)
+    assert torch.equal(got, ref)
 
 
 @pytest.mark.parametrize("m,inter", [(1, 768), (64, 1536), (128, 1024)])

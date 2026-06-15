@@ -17,6 +17,7 @@ def moe_fused_mul_sum_kernel(
     num_tokens,
     stride_m,
     has_expert_map: tl.constexpr,
+    apply_weights: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -38,7 +39,10 @@ def moe_fused_mul_sum_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
     for n in tl.static_range(top_k):
-        b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
+        if apply_weights:
+            b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
+        else:
+            b_val = 1.0
         if has_expert_map:
             id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
             expert_mask = tl.load(expert_map_ptr + id_val) >= 0
@@ -138,6 +142,7 @@ def moe_fused_mul_sum(
     outputs: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    apply_weights: bool = True,
 ) -> torch.Tensor:
     """
     Fused kernel for MoE (Mixture of Experts) to perform weighted summation
@@ -154,6 +159,8 @@ def moe_fused_mul_sum(
             `expert_map` is provided. Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped.
+        apply_weights: Multiply each route by ``topk_weights`` before summing.
+            Set to false when the expert GEMM already applied router weights.
 
     Returns:
         The fused weighted sum of expert outputs.
@@ -191,6 +198,7 @@ def moe_fused_mul_sum(
             num_tokens,
             top_k * size,
             expert_map is not None,
+            apply_weights,
             top_k,
             size,
             BLOCK_M,
