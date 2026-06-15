@@ -124,6 +124,77 @@ def _swiglu_oai_quant_kernel(
     )
 
 
+@triton.jit
+def _swiglu_oai_quant_routed_kernel(
+    g_ptr,
+    aq_ptr,
+    as_ptr,
+    sorted_token_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
+    n_inter,
+    stride_gm,
+    stride_gn,
+    stride_qm,
+    stride_qn,
+    stride_sm,
+    stride_sk,
+    alpha,
+    beta,
+    limit,
+    HAS_LIMIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Route-aware SwiGLU-OAI + MXFP8 quantization for expert parallelism."""
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    num_post = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_M >= num_post:
+        return
+
+    offs_tid = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    route_mask = offs_tid < num_post
+    route_ids = tl.load(
+        sorted_token_ids_ptr + offs_tid,
+        mask=route_mask,
+        other=num_valid_tokens,
+    ).to(tl.int64)
+    route_mask = route_mask & (route_ids < num_valid_tokens)
+    safe_route_ids = tl.where(route_mask, route_ids, 0)
+    offs_c = pid_b * 32 + tl.arange(0, 32)
+
+    gate = tl.load(
+        g_ptr + safe_route_ids[:, None] * stride_gm + offs_c[None, :] * stride_gn,
+        mask=route_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        g_ptr
+        + safe_route_ids[:, None] * stride_gm
+        + (n_inter + offs_c)[None, :] * stride_gn,
+        mask=route_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    if HAS_LIMIT:
+        gate = tl.minimum(gate, limit)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+    act = gate * tl.sigmoid(alpha * gate) * (up + beta)
+    amax = tl.maximum(tl.max(tl.abs(act), axis=1), 1e-30)
+    sb = tl.minimum(tl.maximum(tl.floor(tl.log2(amax)) + 127.0, 0.0), 254.0)
+    descale = tl.exp2(sb - 127.0)
+    aq = (act / descale[:, None]).to(aq_ptr.dtype.element_ty)
+    tl.store(
+        aq_ptr + safe_route_ids[:, None] * stride_qm + offs_c[None, :] * stride_qn,
+        aq,
+        mask=route_mask[:, None],
+    )
+    tl.store(
+        as_ptr + safe_route_ids * stride_sm + pid_b * stride_sk,
+        sb.to(tl.uint8),
+        mask=route_mask,
+    )
+
+
 def swiglu_oai_quantize_mxfp8(
     gate_up: torch.Tensor,
     alpha: float,
@@ -164,6 +235,79 @@ def swiglu_oai_quantize_mxfp8(
         aq,
         asc,
         M,
+        n_inter,
+        g1.stride(0),
+        g1.stride(1),
+        aq.stride(0),
+        aq.stride(1),
+        asc.stride(0),
+        asc.stride(1),
+        float(alpha),
+        float(beta),
+        0.0 if limit is None else float(limit),
+        HAS_LIMIT=limit is not None,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+    return aq, asc
+
+
+def swiglu_oai_quantize_mxfp8_routed(
+    gate_up: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    *,
+    num_valid_tokens: int,
+    max_num_tokens_post_padded: int,
+    alpha: float,
+    beta: float,
+    limit: float | None,
+    block_m: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize only the locally routed rows produced by an EP GEMM1."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+
+    two_i = gate_up.shape[-1]
+    n_inter = two_i // 2
+    if n_inter % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"fused swiglu+quant needs I % {MXFP8_BLOCK_SIZE} == 0, got I={n_inter}"
+        )
+    if max_num_tokens_post_padded % block_m != 0:
+        raise ValueError(
+            "max_num_tokens_post_padded must be block aligned, got "
+            f"{max_num_tokens_post_padded} for block_m={block_m}."
+        )
+
+    g1 = gate_up.reshape(-1, two_i).contiguous()
+    value_dtype = (
+        torch.float8_e4m3fnuz if current_platform.is_fp8_fnuz() else MXFP8_VALUE_DTYPE
+    )
+    aq = torch.empty(
+        (num_valid_tokens, n_inter),
+        dtype=value_dtype,
+        device=g1.device,
+    )
+    asc = torch.empty(
+        (num_valid_tokens, n_inter // MXFP8_BLOCK_SIZE),
+        dtype=MXFP8_SCALE_DTYPE,
+        device=g1.device,
+    )
+    grid = (
+        max_num_tokens_post_padded // block_m,
+        n_inter // MXFP8_BLOCK_SIZE,
+    )
+    _swiglu_oai_quant_routed_kernel[grid](
+        g1,
+        aq,
+        asc,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        num_valid_tokens,
         n_inter,
         g1.stride(0),
         g1.stride(1),

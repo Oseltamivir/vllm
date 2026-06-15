@@ -2132,10 +2132,12 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
     def _retain_bf16_fallback_weights(self, layer: RoutedExperts) -> None:
-        """Keep the BF16 weights selected by the gfx94x TP dispatch policy."""
+        """Configure profiled gfx94x MiniMax-M3 native/BF16 weight storage."""
         from vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe import (
+            _WEIGHT_STORAGE_BF16_ONLY,
+            _WEIGHT_STORAGE_NATIVE_ONLY,
             Mxfp8NativeTritonExperts,
-            _should_store_bf16_only,
+            _mxfp8_weight_storage_policy,
         )
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             dequant_mxfp8_to_bf16,
@@ -2150,6 +2152,20 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
                 "Expected Mxfp8NativeTritonExperts for the gfx94x native backend."
             )
 
+        layer_index = extract_layer_index(layer.layer_name)
+        storage_policy = _mxfp8_weight_storage_policy(
+            self.moe.max_model_len,
+            layer_index,
+            self.moe.ep_size,
+        )
+        if storage_policy == _WEIGHT_STORAGE_NATIVE_ONLY:
+            logger.info_once(
+                "Using native-only MXFP8 storage for one-fifth of long-context "
+                "gfx94x EP MoE layers; the remaining layers retain BF16 for "
+                "large-prefill dispatch."
+            )
+            return
+
         target_dtype = getattr(layer, "orig_dtype", torch.bfloat16)
         w13_bf16 = dequant_mxfp8_to_bf16(layer.w13_weight, layer.w13_weight_scale).to(
             target_dtype
@@ -2157,12 +2173,8 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         w2_bf16 = dequant_mxfp8_to_bf16(layer.w2_weight, layer.w2_weight_scale).to(
             target_dtype
         )
-        layer_index = extract_layer_index(layer.layer_name)
-        store_bf16_only = _should_store_bf16_only(
-            self.moe.max_model_len,
-            layer_index,
-        )
 
+        store_bf16_only = storage_policy == _WEIGHT_STORAGE_BF16_ONLY
         if store_bf16_only:
             replace_parameter(layer, "w13_weight", w13_bf16)
             replace_parameter(layer, "w2_weight", w2_bf16)
@@ -2177,10 +2189,10 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
 
         if self.moe.max_model_len <= 4096:
             logger.info_once(
-                "Retaining BF16 MXFP8 MoE weights for gfx94x TP decode and "
-                "prefill dispatch."
+                "Retaining native MXFP8 and BF16 MoE weights for profiled "
+                "gfx94x MiniMax-M3 dispatch."
             )
-        else:
+        elif self.moe.ep_size == 1:
             logger.info_once(
                 "Using BF16-only storage for one-fifth of gfx94x TP MoE "
                 "layers and retaining both MXFP8 and BF16 weights for the "

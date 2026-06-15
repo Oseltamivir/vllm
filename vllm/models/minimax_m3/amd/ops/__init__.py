@@ -13,6 +13,7 @@ from vllm.models.minimax_m3.amd.ops.gemma_rmsnorm import (
 )
 from vllm.models.minimax_m3.amd.ops.swiglu_oai import (
     swiglu_oai_quantize_mxfp8,
+    swiglu_oai_quantize_mxfp8_routed,
     swiglu_oai_split,
 )
 
@@ -21,4 +22,5 @@ __all__ = [
     "gemma_fused_add_rmsnorm",
     "swiglu_oai_split",
     "swiglu_oai_quantize_mxfp8",
+    "swiglu_oai_quantize_mxfp8_routed",
 ]
