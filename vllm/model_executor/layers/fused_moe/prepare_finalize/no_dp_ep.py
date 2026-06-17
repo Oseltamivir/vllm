@@ -38,6 +38,11 @@ def _quantize_input(
 
 
 class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
+    def supports_dbo(self) -> bool:
+        # This path only quantizes local inputs and reduces local expert
+        # outputs; it has no collective that needs async prepare/finalize.
+        return True
+
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard

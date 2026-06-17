@@ -245,6 +245,16 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return False
 
+    def supports_dbo(self) -> bool:
+        """
+        Indicates whether prepare and finalize are safe to run under DBO.
+
+        Async prepare/finalize implementations already coordinate their
+        communication with the DBO scheduler. Synchronous implementations
+        must opt in explicitly when they do not perform cross-rank work.
+        """
+        return self.supports_async()
+
     def on_commit(self) -> None:
         """
         Runs after this prepare/finalize has been committed to the active
@@ -1136,7 +1146,7 @@ class FusedMoEKernelModularImpl:
             # We shouldn't be running an a2a kernel that doesn't
             # support async prepare/finalize
             # TODO(lucas): enable in follow-up
-            assert not dbo_enabled()
+            assert not dbo_enabled() or self.prepare_finalize.supports_dbo()
 
             (
                 a1q,
@@ -1306,7 +1316,7 @@ class FusedMoEKernelModularImpl:
                 dimension) needed by the shared expert MLP.
         """
         if not self.prepare_finalize.supports_async():
-            assert not dbo_enabled()
+            assert not dbo_enabled() or self.prepare_finalize.supports_dbo()
 
             self.prepare_finalize.finalize(
                 output,
