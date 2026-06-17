@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     determine_expert_map,
+    determine_expert_placement_strategy,
 )
 
 
@@ -42,6 +45,62 @@ def verify_round_robin_pattern(expert_map, ep_rank, ep_size, global_num_experts)
     expected_local_ids = list(range(local_num_experts))
     assert local_expert_ids == expected_local_ids, (
         f"Expected local expert IDs {expected_local_ids}, got {local_expert_ids}"
+    )
+
+
+def test_ungrouped_round_robin_requires_model_opt_in():
+    parallel_config = SimpleNamespace(
+        use_all2all_kernels=False,
+        needs_round_robin_routing_tables=False,
+        all2all_backend=None,
+    )
+
+    assert (
+        determine_expert_placement_strategy(
+            expert_placement_strategy="round_robin",
+            moe_parallel_config=parallel_config,
+            num_expert_group=None,
+            num_redundant_experts=0,
+            enable_eplb=False,
+        )
+        == "linear"
+    )
+    assert (
+        determine_expert_placement_strategy(
+            expert_placement_strategy="round_robin",
+            moe_parallel_config=parallel_config,
+            num_expert_group=None,
+            num_redundant_experts=0,
+            enable_eplb=False,
+            allow_ungrouped_round_robin=True,
+        )
+        == "round_robin"
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_redundant_experts", "enable_eplb"),
+    [(1, False), (0, True)],
+)
+def test_ungrouped_round_robin_opt_in_preserves_eplb_guards(
+    num_redundant_experts, enable_eplb
+):
+    parallel_config = SimpleNamespace(
+        use_all2all_kernels=False,
+        needs_round_robin_routing_tables=False,
+        all2all_backend=None,
+    )
+
+    assert (
+        determine_expert_placement_strategy(
+            expert_placement_strategy="round_robin",
+            moe_parallel_config=parallel_config,
+            num_expert_group=None,
+            num_redundant_experts=num_redundant_experts,
+            enable_eplb=enable_eplb,
+            allow_ungrouped_round_robin=True,
+        )
+        == "linear"
     )
 
 

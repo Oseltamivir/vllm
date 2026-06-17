@@ -119,10 +119,14 @@ def determine_expert_placement_strategy(
     num_expert_group: int | None,
     num_redundant_experts: int,
     enable_eplb: bool,
+    allow_ungrouped_round_robin: bool = False,
 ) -> ExpertPlacementStrategy:
     if expert_placement_strategy == "round_robin":
         round_robin_supported = (
-            (num_expert_group is not None and num_expert_group > 1)
+            (
+                (num_expert_group is not None and num_expert_group > 1)
+                or allow_ungrouped_round_robin
+            )
             and num_redundant_experts == 0
             and not enable_eplb
         )
@@ -130,8 +134,9 @@ def determine_expert_placement_strategy(
         if not round_robin_supported:
             logger.warning(
                 "Round-robin expert placement is only supported for "
-                "models with multiple expert groups and no redundant "
-                "experts. Falling back to linear expert placement."
+                "models with multiple expert groups or an explicit model "
+                "opt-in, and no redundant experts. Falling back to linear "
+                "expert placement."
             )
             return "linear"
         if (
@@ -190,6 +195,7 @@ class ExpertMapManager:
         moe_parallel_config: FusedMoEParallelConfig,
         placement_strategy: ExpertPlacementStrategy,
         enable_eplb: bool,
+        allow_ungrouped_round_robin: bool = False,
         num_fused_shared_experts: int = 0,
         rocm_aiter_enabled: bool = False,
     ):
@@ -219,6 +225,7 @@ class ExpertMapManager:
                 num_expert_group=num_expert_group,
                 num_redundant_experts=num_redundant_experts,
                 enable_eplb=enable_eplb,
+                allow_ungrouped_round_robin=allow_ungrouped_round_robin,
             )
 
         # Determine effective placement strategy

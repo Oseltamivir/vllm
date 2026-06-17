@@ -318,6 +318,11 @@ class MiniMaxM3MoE(nn.Module):
             shared_experts=self.shared_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            # M3's learned expert IDs can be unevenly clustered across the
+            # default contiguous EP partitions. Keep the global default
+            # conservative while allowing an explicit round-robin experiment
+            # on the ROCm path.
+            allow_ungrouped_round_robin=True,
         )
 
     @staticmethod

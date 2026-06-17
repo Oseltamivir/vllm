@@ -144,6 +144,7 @@ def FusedMoE(
     runner_args: dict[str, Any] | None = None,
     routed_experts_cls: type[RoutedExperts] | None = None,
     routed_experts_args: dict[str, Any] | None = None,
+    allow_ungrouped_round_robin: bool = False,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -202,6 +203,8 @@ def FusedMoE(
         runner_args: Additional arguments for runner constructor
         routed_experts_cls: Custom RoutedExperts class (None = use default)
         routed_experts_args: Additional arguments for routed_experts constructor
+        allow_ungrouped_round_robin: Allow a model without grouped routing to
+                                    opt into round-robin expert placement.
 
     Returns:
         MoERunner: Configured MoE execution pipeline ready for forward passes
@@ -261,6 +264,7 @@ def FusedMoE(
         moe_parallel_config=moe_parallel_config,
         placement_strategy=vllm_config.parallel_config.expert_placement_strategy,
         enable_eplb=eplb_state is not None,
+        allow_ungrouped_round_robin=allow_ungrouped_round_robin,
         num_fused_shared_experts=num_fused_shared_experts,
         rocm_aiter_enabled=rocm_aiter_ops.is_fused_moe_enabled() and is_act_and_mul,
     )
