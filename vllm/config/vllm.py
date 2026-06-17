@@ -888,7 +888,7 @@ class VllmConfig:
                     "pipeline parallelism (PP > 1)."
                 )
 
-            # Incompatible with any KV connector - covers both PD disaggregation
+            # Incompatible with any KV connector — covers both PD disaggregation
             # (kv_producer/kv_consumer: routing captured on P can't reach D) and
             # single-instance KV offload/sharing (kv_both: slot_mapping semantics
             # change when KV blocks live outside local GPU memory, breaking the
@@ -1083,7 +1083,7 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile -
+        # For model classes don't carry @support_torch_compile —
         # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
         # it unless the user has explicitly opted out via the env var.
         if (
@@ -1435,8 +1435,14 @@ class VllmConfig:
             )
 
         if self.parallel_config.use_ubatching:
-            # deepep_* and nixl_ep backends are only required when EP is active.
-            if self.parallel_config.enable_expert_parallel:
+            # DP=1 expert parallelism uses local experts followed by a TP
+            # all-reduce, so it can use the generic TP DBO yield path. DP+EP
+            # dispatches tokens across ranks and still requires a DBO-aware
+            # all-to-all backend.
+            if (
+                self.parallel_config.enable_expert_parallel
+                and self.parallel_config.data_parallel_size > 1
+            ):
                 a2a_backend = self.parallel_config.all2all_backend
                 if a2a_backend not in [
                     "deepep_low_latency",
@@ -1444,7 +1450,7 @@ class VllmConfig:
                     "nixl_ep",
                 ]:
                     raise ValueError(
-                        "Microbatching with EP requires --all2all-backend="
+                        "Microbatching with DP+EP requires --all2all-backend="
                         "deepep_low_latency, deepep_high_throughput, or nixl_ep; "
                         f"got {a2a_backend}."
                     )
