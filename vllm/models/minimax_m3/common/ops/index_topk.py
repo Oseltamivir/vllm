@@ -407,7 +407,13 @@ def _decode_index_score_kernel(
     num_kv_chunks,
     USE_PDL: tl.constexpr,
     USE_FP8: tl.constexpr,
+    USE_VECTOR_REDUCTION: tl.constexpr,
+    VECTOR_SIZE_D: tl.constexpr,
 ):
+    if USE_VECTOR_REDUCTION:
+        tl.static_assert(num_idx_heads == 1)
+        tl.static_assert(head_dim % VECTOR_SIZE_D == 0)
+
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_b = tl.program_id(0)  # flattened query-token id
     pid_c = tl.program_id(1)
@@ -436,13 +442,14 @@ def _decode_index_score_kernel(
     bt_row = block_table_ptr + req_id * stride_bt_b
     # Force-select init (1e30) and local (1e29, higher priority) blocks.
     local_start = tl.maximum(0, num_blocks - local_blocks)
-    # query vectors across all heads
-    q = tl.load(
-        q_ptr
-        + pid_b * stride_q_n
-        + tl.arange(0, num_idx_heads) * stride_q_h
-        + off_d[:, None] * stride_q_d,
-    )  # [D,H]
+    if not USE_VECTOR_REDUCTION:
+        # query vectors across all heads
+        q = tl.load(
+            q_ptr
+            + pid_b * stride_q_n
+            + tl.arange(0, num_idx_heads) * stride_q_h
+            + off_d[:, None] * stride_q_d,
+        )  # [D,H]
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
@@ -450,7 +457,26 @@ def _decode_index_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        if USE_FP8:
+        if USE_VECTOR_REDUCTION:
+            # M3 decode has one 128-wide index head. A matrix-core dot pads
+            # its N=1 output to an MFMA tile, so most output lanes do no useful
+            # work. Reduce a wave64-aligned slice at a time instead: each wave
+            # cooperates on one K row while keeping the accumulator in FP32.
+            kq_vector = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
+            for d_start in tl.static_range(0, head_dim, VECTOR_SIZE_D):
+                vector_off_d = d_start + tl.arange(0, VECTOR_SIZE_D)
+                q_vector = tl.load(
+                    q_ptr + pid_b * stride_q_n + vector_off_d * stride_q_d,
+                ).to(tl.float32)
+                k_vector = tl.load(
+                    ik_cache_ptr
+                    + page * stride_ik_blk
+                    + off_k[:, None] * stride_ik_pos
+                    + vector_off_d[None, :] * stride_ik_d,
+                ).to(tl.float32)
+                kq_vector += tl.sum(k_vector * q_vector[None, :], axis=1)
+            kq = kq_vector[:, None] * sm_scale_log2e
+        elif USE_FP8:
             cache_block_ptr = ik_cache_ptr + page * stride_ik_blk
             k_fp8 = tl.load(
                 cache_block_ptr + off_k[:, None] * head_dim + off_d[None, :],
@@ -906,6 +932,12 @@ def minimax_m3_index_decode(
     else:
         kernel_index_cache = index_kv_cache
     use_pdl = current_platform.is_arch_support_pdl()
+    use_vector_reduction = (
+        current_platform.is_rocm()
+        and not use_fp8
+        and num_idx_heads == 1
+        and head_dim == 128
+    )
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
     # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
     # launch_pdl was specified but unrecognised"). Only pass it when PDL is
@@ -931,7 +963,11 @@ def minimax_m3_index_decode(
     num_kv_chunks = 1 << (target.bit_length() - 1)
     grid_score = (batch, num_kv_chunks)
     score_launch = dict(pdl_launch)
-    if tune_score_launch:
+    if use_vector_reduction:
+        # Four wave64s process four K rows concurrently. The 64-wide D tile
+        # follows AITER's wave-per-row GEMV and CK's warp-per-row reductions.
+        score_launch.update(num_warps=4, num_stages=1)
+    elif tune_score_launch:
         score_launch.update(num_warps=2, num_stages=3)
     _decode_index_score_kernel[grid_score](
         idx_q,
@@ -959,6 +995,8 @@ def minimax_m3_index_decode(
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
         USE_FP8=use_fp8,
+        USE_VECTOR_REDUCTION=use_vector_reduction,
+        VECTOR_SIZE_D=64,
         **score_launch,
     )
 

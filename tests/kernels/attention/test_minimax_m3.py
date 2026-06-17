@@ -405,6 +405,67 @@ def test_decode_index_topk_correctness(
 
 @pytest.mark.skipif(
     not current_platform.is_rocm(),
+    reason="The single-head vector reduction is enabled only on ROCm.",
+)
+def test_decode_bf16_single_head_index_topk_correctness():
+    head_dim = 128
+    num_idx_heads = 1
+    topk = 6
+    decode_query_len = 1
+    seq_lens = torch.tensor((129, 513, 1025), device="cuda", dtype=torch.int32)
+    q_lens = torch.full_like(seq_lens, decode_query_len)
+    prefix_lens = seq_lens - decode_query_len
+    max_seq_len = seq_lens.max().item()
+    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_pages = seq_lens.numel() * max_blocks
+    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        seq_lens.numel(), max_blocks
+    )
+    idx_q = torch.randn(
+        seq_lens.numel(),
+        num_idx_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    index_kv_cache = torch.randn(
+        num_pages,
+        BLOCK_SIZE,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    actual = minimax_m3_index_decode(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len=max_seq_len,
+        topk=topk,
+        init_blocks=0,
+        local_blocks=1,
+        num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
+        decode_query_len=decode_query_len,
+    )
+    expected = _reference_index_topk(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        q_lens,
+        seq_lens,
+        prefix_lens,
+        topk,
+        0,
+        1,
+        head_dim**-0.5,
+    )
+    _assert_topk_indices_equal_unordered(actual, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
     reason="MiniMax M3 FP8 index cache is currently enabled only on ROCm.",
 )
 def test_decode_fp8_index_topk_correctness():
