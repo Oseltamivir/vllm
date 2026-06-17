@@ -62,13 +62,20 @@ def _is_profiled_minimax_m3_config(moe_config: FusedMoEConfig) -> bool:
 
 
 def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
-    """Retain mixed BF16/native weights only for MiniMax-M3 tensor parallelism."""
-    return _is_profiled_minimax_m3_config(moe_config) and moe_config.ep_size == 1
+    """Retain mixed weights where the profiled native/BF16 dispatch wins."""
+    return _is_profiled_minimax_m3_config(moe_config) and (
+        moe_config.ep_size == 1
+        or (moe_config.ep_size == 8 and moe_config.max_model_len <= 4096)
+    )
 
 
 def _should_use_native_ep(moe_config: FusedMoEConfig) -> bool:
-    """Use compressed native weights for the profiled MiniMax-M3 EP8 shape."""
-    return _is_profiled_minimax_m3_config(moe_config) and moe_config.ep_size == 8
+    """Use mixed native/BF16 experts for profiled short-context EP8."""
+    return (
+        _is_profiled_minimax_m3_config(moe_config)
+        and moe_config.ep_size == 8
+        and moe_config.max_model_len <= 4096
+    )
 
 
 def _should_store_bf16_only(max_model_len: int, layer_index: int) -> bool:
@@ -535,6 +542,7 @@ def fused_moe_mxfp8_native(
         global_num_experts,
         expert_map,
         ignore_invalid_experts=expert_map is not None,
+        num_local_experts=w13.shape[0] if expert_map is not None else None,
     )
     use_sparse_ep_path = expert_map is not None and current_platform.is_fp8_fnuz()
 

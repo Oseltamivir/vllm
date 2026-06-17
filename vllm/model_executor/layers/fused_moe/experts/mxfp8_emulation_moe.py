@@ -11,11 +11,20 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _prepare_expert_assignment,
+    invoke_fused_moe_triton_kernel,
+)
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+    moe_fused_mul_sum,
+)
+from vllm.model_executor.layers.fused_moe.utils import _resize_cache
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
 )
@@ -24,8 +33,36 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
     kMxfp8Static,
 )
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl
 
 logger = init_logger(__name__)
+
+# Keep unprofiled prefill and mixed batches on the generic TritonExperts path.
+_MINIMAX_M3_MI300X_EP_MAX_DECODE_TOKENS = 256
+_MINIMAX_M3_MI300X_EP_DECODE_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 1,
+    "SPLIT_K": 1,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+
+
+def _is_minimax_m3_mi300x_ep8(moe_config: FusedMoEConfig) -> bool:
+    """Match the profiled MiniMax-M3 EP8 shape on gfx94x."""
+    return (
+        current_platform.is_fp8_fnuz()
+        and moe_config.ep_size == 8
+        and moe_config.has_shared_experts
+        and moe_config.num_experts == 128
+        and moe_config.experts_per_token == 4
+        and moe_config.hidden_dim == 6144
+        and moe_config.intermediate_size == 3072
+        and moe_config.max_model_len > 0
+    )
 
 
 class Mxfp8TritonExpertsBase(TritonExperts):
@@ -67,6 +104,7 @@ class Mxfp8EmulationTritonExperts(Mxfp8TritonExpertsBase):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
+        self.use_sparse_mi300x_ep = _is_minimax_m3_mi300x_ep8(moe_config)
         logger.warning_once(
             "Using Mxfp8EmulationTritonExperts MoE backend. Weights are "
             "dequantized to BF16 on the fly; this is slower than a native "
@@ -122,6 +160,109 @@ class Mxfp8EmulationTritonExperts(Mxfp8TritonExpertsBase):
             return
         super().activation(activation, output, input)
 
+    def _apply_sparse_mi300x_ep(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+        expert_map: torch.Tensor,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+    ) -> None:
+        """Run only local EP routes with the efficient BF16 grouped GEMMs."""
+        E, num_tokens, N, K, top_k_num = self.moe_problem_size(
+            hidden_states, w1, w2, topk_ids
+        )
+        if global_num_experts == -1:
+            global_num_experts = expert_map.numel()
+        config = _MINIMAX_M3_MI300X_EP_DECODE_CONFIG
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            _prepare_expert_assignment(
+                topk_ids,
+                config,
+                num_tokens,
+                top_k_num,
+                global_num_experts,
+                expert_map,
+                ignore_invalid_experts=True,
+                num_local_experts=E,
+            )
+        )
+        assert sorted_token_ids is not None
+
+        activation_dim = N // 2
+        intermediate_gate_up = _resize_cache(
+            workspace2,
+            (num_tokens, top_k_num, N),
+        )
+        intermediate_activation = _resize_cache(
+            workspace13,
+            (num_tokens * top_k_num, activation_dim),
+        )
+
+        invoke_fused_moe_triton_kernel(
+            hidden_states,
+            w1,
+            intermediate_gate_up,
+            None,
+            None,
+            None,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            False,
+            top_k_num,
+            config,
+            compute_type=tl.bfloat16,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+        )
+        self.activation(
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+            intermediate_activation,
+            intermediate_gate_up.view(-1, N),
+        )
+
+        intermediate_output = _resize_cache(
+            workspace2,
+            (num_tokens, top_k_num, K),
+        )
+        invoke_fused_moe_triton_kernel(
+            intermediate_activation,
+            w2,
+            intermediate_output,
+            None,
+            None,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            True,
+            1,
+            config,
+            compute_type=tl.bfloat16,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+        )
+        moe_fused_mul_sum(
+            intermediate_output,
+            topk_weights,
+            outputs=output,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
+            apply_weights=False,
+        )
+
     def apply(
         self,
         output: torch.Tensor,
@@ -156,6 +297,30 @@ class Mxfp8EmulationTritonExperts(Mxfp8TritonExpertsBase):
             w2_bf16 = dequant_mxfp8_to_bf16(w2, self.w2_scale_val).to(
                 hidden_states.dtype
             )
+
+        use_sparse_ep = (
+            self.use_sparse_mi300x_ep
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] <= _MINIMAX_M3_MI300X_EP_MAX_DECODE_TOKENS
+            and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+            and expert_map is not None
+            and not apply_router_weight_on_input
+            and getattr(self, "_lora_context", None) is None
+        )
+        if use_sparse_ep:
+            self._apply_sparse_mi300x_ep(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1_bf16,
+                w2=w2_bf16,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                workspace13=workspace13,
+                workspace2=workspace2,
+            )
+            return
 
         super().apply(
             output=output,
