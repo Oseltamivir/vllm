@@ -58,13 +58,12 @@ def _index_k_quant_and_cache_kernel(
     fp8_max: tl.constexpr = 224.0 if IS_FNUZ else 448.0
     scale = tl.exp2(tl.ceil(tl.log2(absmax / fp8_max)))
     scaled = index_k / scale
-    index_k_fp8 = scaled.to(tl.float8e4b15) if IS_FNUZ else scaled.to(tl.float8e4nv)
-    index_k_raw = index_k_fp8.to(tl.uint8, bitcast=True)
+    index_k_fp8 = scaled.to(index_cache_ptr.type.element_ty)
 
     block_idx = slot_idx // cache_block_size
     pos_in_block = slot_idx % cache_block_size
     cache_block_ptr = index_cache_ptr + block_idx.to(tl.int64) * stride_cache_block
-    tl.store(cache_block_ptr + pos_in_block * head_dim + offsets, index_k_raw)
+    tl.store(cache_block_ptr + pos_in_block * head_dim + offsets, index_k_fp8)
     scale_ptr = (cache_block_ptr + cache_block_size * head_dim + pos_in_block * 4).to(
         tl.pointer_type(tl.float32)
     )
@@ -82,9 +81,12 @@ def minimax_m3_index_k_quant_and_cache(
     assert index_cache.ndim == 3 and index_cache.dtype == torch.uint8
     assert index_cache.shape[2] == index_k.shape[1] + 4
     assert slot_mapping.shape[0] <= index_k.shape[0]
+    # Triton cannot explicitly cast to FP8 FNUZ on gfx942; use the typed
+    # pointer element so the store lowers the conversion instead.
+    index_cache_fp8 = index_cache.view(current_platform.fp8_dtype())
     _index_k_quant_and_cache_kernel[(slot_mapping.shape[0],)](
         index_k,
-        index_cache,
+        index_cache_fp8,
         slot_mapping,
         index_k.stride(0),
         index_k.stride(1),
