@@ -84,14 +84,13 @@ def _select_rocm_mxfp8_backend(
     if current_platform.is_fp8_fnuz() and config.ep_size > 1:
         from vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe import (
             Mxfp8NativeTritonExperts,
-            _should_use_bf16_decode_fallback,
+            _should_use_native_ep,
         )
 
-        if _should_use_bf16_decode_fallback(config):
+        if _should_use_native_ep(config):
             logger.info_once(
                 "Using the profiled gfx94x MiniMax-M3 EP8 MXFP8 backend: "
-                "native local-route kernels for decode and retained BF16 "
-                "experts for large prefill."
+                "native local-route kernels with compressed-only expert weights."
             )
             return Fp8MoeBackend.NATIVE_MXFP8, Mxfp8NativeTritonExperts
 

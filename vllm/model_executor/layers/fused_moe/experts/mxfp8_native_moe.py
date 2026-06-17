@@ -46,13 +46,9 @@ _BF16_DECODE_TOKEN_THRESHOLD = 8
 # between 827 and 843 tokens on MI300X. Keep the cutoff tile-aligned.
 _BF16_PREFILL_TOKEN_THRESHOLD = 832
 _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE = 5
-_WEIGHT_STORAGE_DUAL = "dual"
-_WEIGHT_STORAGE_BF16_ONLY = "bf16_only"
-_WEIGHT_STORAGE_NATIVE_ONLY = "native_only"
 
 
-def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
-    """Limit mixed BF16/native storage to profiled MiniMax-M3 shapes."""
+def _is_profiled_minimax_m3_config(moe_config: FusedMoEConfig) -> bool:
     return (
         current_platform.is_fp8_fnuz()
         and moe_config.ep_size in (1, 8)
@@ -65,16 +61,20 @@ def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
     )
 
 
-def _mxfp8_weight_storage_policy(
-    max_model_len: int,
-    layer_index: int,
-    ep_size: int,
-) -> str:
-    if max_model_len <= 4096 or layer_index % _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE != 0:
-        return _WEIGHT_STORAGE_DUAL
-    if ep_size > 1:
-        return _WEIGHT_STORAGE_NATIVE_ONLY
-    return _WEIGHT_STORAGE_BF16_ONLY
+def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
+    """Retain mixed BF16/native weights only for MiniMax-M3 tensor parallelism."""
+    return _is_profiled_minimax_m3_config(moe_config) and moe_config.ep_size == 1
+
+
+def _should_use_native_ep(moe_config: FusedMoEConfig) -> bool:
+    """Use compressed native weights for the profiled MiniMax-M3 EP8 shape."""
+    return _is_profiled_minimax_m3_config(moe_config) and moe_config.ep_size == 8
+
+
+def _should_store_bf16_only(max_model_len: int, layer_index: int) -> bool:
+    return (
+        max_model_len > 4096 and layer_index % _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE == 0
+    )
 
 
 def _should_use_bf16_experts(

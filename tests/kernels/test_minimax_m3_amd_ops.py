@@ -112,7 +112,7 @@ def test_mxfp8_gfx94x_grouped_gemm_config(
         ({}, True),
         ({"max_model_len": 10240}, True),
         ({"max_model_len": 0}, False),
-        ({"ep_size": 8}, True),
+        ({"ep_size": 8}, False),
         ({"ep_size": 4}, False),
         ({"has_shared_experts": False}, False),
         ({"experts_per_token": 8}, False),
@@ -166,6 +166,39 @@ def test_mxfp8_bf16_decode_fallback_disabled_on_gfx950(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"ep_size": 8}, True),
+        ({}, False),
+        ({"ep_size": 4}, False),
+        ({"max_model_len": 0, "ep_size": 8}, False),
+        ({"has_shared_experts": False, "ep_size": 8}, False),
+    ],
+)
+def test_mxfp8_native_ep_scope(monkeypatch, overrides, expected):
+    from vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe import (
+        _should_use_native_ep,
+    )
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "is_fp8_fnuz",
+        classmethod(lambda cls: True),
+    )
+    values = {
+        "ep_size": 1,
+        "has_shared_experts": True,
+        "num_experts": 128,
+        "experts_per_token": 4,
+        "hidden_dim": 6144,
+        "intermediate_size": 3072,
+        "max_model_len": 2304,
+    }
+    values.update(overrides)
+    assert _should_use_native_ep(SimpleNamespace(**values)) is expected
+
+
+@pytest.mark.parametrize(
     (
         "num_tokens",
         "native_weights_available",
@@ -206,22 +239,20 @@ def test_mxfp8_bf16_expert_dispatch(
 
 
 @pytest.mark.parametrize(
-    ("max_model_len", "layer_index", "ep_size", "expected"),
+    ("max_model_len", "layer_index", "expected"),
     [
-        (2304, 0, 1, "dual"),
-        (2304, 0, 8, "dual"),
-        (9472, 0, 1, "bf16_only"),
-        (9472, 0, 8, "native_only"),
-        (9472, 1, 8, "dual"),
-        (9472, 5, 8, "native_only"),
+        (2304, 0, False),
+        (9472, 0, True),
+        (9472, 1, False),
+        (9472, 5, True),
     ],
 )
-def test_mxfp8_weight_storage_policy(max_model_len, layer_index, ep_size, expected):
+def test_mxfp8_bf16_only_storage_policy(max_model_len, layer_index, expected):
     from vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe import (
-        _mxfp8_weight_storage_policy,
+        _should_store_bf16_only,
     )
 
-    assert _mxfp8_weight_storage_policy(max_model_len, layer_index, ep_size) == expected
+    assert _should_store_bf16_only(max_model_len, layer_index) is expected
 
 
 @pytest.mark.parametrize(
