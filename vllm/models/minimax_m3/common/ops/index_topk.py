@@ -476,26 +476,27 @@ def _decode_index_score_kernel(
                 ).to(tl.float32)
                 kq_vector += tl.sum(k_vector * q_vector[None, :], axis=1)
             kq = kq_vector[:, None] * sm_scale_log2e
-        elif USE_FP8:
-            cache_block_ptr = ik_cache_ptr + page * stride_ik_blk
-            k_fp8 = tl.load(
-                cache_block_ptr + off_k[:, None] * head_dim + off_d[None, :],
-            )
-            scale_ptrs = (cache_block_ptr + BLOCK_SIZE_K * head_dim + off_k * 4).to(
-                tl.pointer_type(tl.float32)
-            )
-            k_scale = tl.load(scale_ptrs)
-            k = k_fp8.to(tl.bfloat16)
         else:
-            k = tl.load(
-                ik_cache_ptr
-                + page * stride_ik_blk
-                + off_k[:, None] * stride_ik_pos
-                + off_d * stride_ik_d,
-            )  # [N,D]
-        kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
-        if USE_FP8:
-            kq *= k_scale[:, None]
+            if USE_FP8:
+                cache_block_ptr = ik_cache_ptr + page * stride_ik_blk
+                k_fp8 = tl.load(
+                    cache_block_ptr + off_k[:, None] * head_dim + off_d[None, :],
+                )
+                scale_ptrs = (
+                    cache_block_ptr + BLOCK_SIZE_K * head_dim + off_k * 4
+                ).to(tl.pointer_type(tl.float32))
+                k_scale = tl.load(scale_ptrs)
+                k = k_fp8.to(tl.bfloat16)
+            else:
+                k = tl.load(
+                    ik_cache_ptr
+                    + page * stride_ik_blk
+                    + off_k[:, None] * stride_ik_pos
+                    + off_d * stride_ik_d,
+                )  # [N,D]
+            kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
+            if USE_FP8:
+                kq *= k_scale[:, None]
         kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
         is_init = blk < init_blocks
