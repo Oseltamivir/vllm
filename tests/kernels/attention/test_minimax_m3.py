@@ -11,6 +11,7 @@ from vllm.models.minimax_m3.common.indexer import (
 )
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode,
+    minimax_m3_index_k_quant_and_cache,
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
@@ -185,6 +186,30 @@ def _assert_topk_indices_equal_unordered(
         assert set(actual_row) == set(expected_row)
 
 
+def _quantize_index_cache(index_kv_cache: torch.Tensor) -> torch.Tensor:
+    """Quantize a dense BF16 index cache into the production paged layout."""
+    num_pages, block_size, head_dim = index_kv_cache.shape
+    assert head_dim == 128
+    quant_cache = torch.zeros(
+        num_pages,
+        block_size,
+        head_dim + 4,
+        dtype=torch.uint8,
+        device=index_kv_cache.device,
+    )
+    slot_mapping = torch.arange(
+        num_pages * block_size,
+        dtype=torch.int64,
+        device=index_kv_cache.device,
+    )
+    minimax_m3_index_k_quant_and_cache(
+        index_kv_cache.reshape(-1, head_dim),
+        quant_cache,
+        slot_mapping,
+    )
+    return quant_cache
+
+
 def test_prefill_index_topk_correctness():
     topk = 6
     init_blocks = 0
@@ -242,6 +267,71 @@ def test_prefill_index_topk_correctness():
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
+    )
+    _assert_topk_indices_equal_unordered(actual, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="MiniMax M3 FP8 index cache is currently enabled only on ROCm.",
+)
+def test_prefill_fp8_index_topk_correctness():
+    num_idx_heads = 1
+    head_dim = 128
+    topk = 4
+    q_lens = torch.tensor((3, 2), device="cuda", dtype=torch.int32)
+    prefix_lens = torch.tensor((0, 512), device="cuda", dtype=torch.int32)
+    seq_lens = prefix_lens + q_lens
+    batch = q_lens.numel()
+    max_seq_len = seq_lens.max().item()
+    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_pages = batch * max_blocks
+    cu_seqlens = torch.zeros(batch + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = q_lens.cumsum(0)
+    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        batch, max_blocks
+    )
+    idx_q = torch.ones(q_lens.sum().item(), num_idx_heads, head_dim, device="cuda")
+    dense_cache = torch.empty(
+        num_pages, BLOCK_SIZE, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    for req_id in range(batch):
+        for block_id in range(max_blocks):
+            dense_cache[block_table[req_id, block_id]].fill_(block_id + 1)
+    quant_cache = _quantize_index_cache(dense_cache)
+
+    score = minimax_m3_index_score(
+        idx_q,
+        quant_cache,
+        block_table,
+        cu_seqlens,
+        seq_lens,
+        prefix_lens,
+        max_query_len=q_lens.max().item(),
+        max_seq_len=max_seq_len,
+        num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
+    )
+    actual = minimax_m3_index_topk(
+        score,
+        cu_seqlens,
+        prefix_lens,
+        max_query_len=q_lens.max().item(),
+        topk=topk,
+        init_blocks=0,
+        local_blocks=1,
+    )
+    expected = _reference_index_topk(
+        idx_q,
+        dense_cache,
+        block_table,
+        q_lens,
+        seq_lens,
+        prefix_lens,
+        topk,
+        0,
+        1,
         head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)
@@ -308,6 +398,61 @@ def test_decode_index_topk_correctness(
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
+    )
+    _assert_topk_indices_equal_unordered(actual, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="MiniMax M3 FP8 index cache is currently enabled only on ROCm.",
+)
+def test_decode_fp8_index_topk_correctness():
+    head_dim = 128
+    num_idx_heads = 1
+    topk = 4
+    decode_query_len = 1
+    seq_lens = torch.tensor((129, 513), device="cuda", dtype=torch.int32)
+    q_lens = torch.full_like(seq_lens, decode_query_len)
+    prefix_lens = seq_lens - decode_query_len
+    max_seq_len = seq_lens.max().item()
+    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_pages = seq_lens.numel() * max_blocks
+    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        seq_lens.numel(), max_blocks
+    )
+    idx_q = torch.ones(seq_lens.numel(), num_idx_heads, head_dim, device="cuda")
+    dense_cache = torch.empty(
+        num_pages, BLOCK_SIZE, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    for req_id in range(seq_lens.numel()):
+        for block_id in range(max_blocks):
+            dense_cache[block_table[req_id, block_id]].fill_(block_id + 1)
+    quant_cache = _quantize_index_cache(dense_cache)
+
+    actual = minimax_m3_index_decode(
+        idx_q,
+        quant_cache,
+        block_table,
+        seq_lens,
+        max_seq_len=max_seq_len,
+        topk=topk,
+        init_blocks=0,
+        local_blocks=1,
+        num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
+        decode_query_len=decode_query_len,
+    )
+    expected = _reference_index_topk(
+        idx_q,
+        dense_cache,
+        block_table,
+        q_lens,
+        seq_lens,
+        prefix_lens,
+        topk,
+        0,
+        1,
         head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)

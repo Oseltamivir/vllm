@@ -31,6 +31,7 @@ from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_score,
     minimax_m3_index_topk,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -120,16 +121,17 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         backend_cls: type[AttentionBackend] = MiniMaxM3IndexerBackend,
     ) -> None:
         super().__init__()
-        if indexer_kv_dtype != "bf16":
+        if indexer_kv_dtype not in ("bf16", "fp8"):
             raise NotImplementedError(
                 f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported yet "
-                "for the MiniMax M3 indexer cache (only 'bf16')."
+                "for the MiniMax M3 indexer cache."
             )
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
         self.indexer_kv_dtype = indexer_kv_dtype
-        # Storage dtype for the side cache (bf16 today; quantized layouts later).
-        self.dtype = torch.bfloat16
+        # FP8 stores one 128-byte vector plus one float32 scale per token.
+        self.cache_head_dim = head_dim if indexer_kv_dtype == "bf16" else head_dim + 4
+        self.dtype = torch.bfloat16 if indexer_kv_dtype == "bf16" else torch.uint8
         self.prefix = prefix
         self.cache_config = cache_config
         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
@@ -144,7 +146,7 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.head_dim,
+            head_size=self.cache_head_dim,
             dtype=self.dtype,
         )
 
@@ -447,7 +449,12 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} needs the (not-yet-added) "
             "CuteDSL indexer impl."
         )
-    if indexer_kv_dtype != "bf16":
+    if indexer_kv_dtype == "fp8":
+        if not current_platform.is_rocm():
+            raise NotImplementedError(
+                "MiniMax M3 FP8 indexer cache is currently supported only on ROCm."
+            )
+    elif indexer_kv_dtype != "bf16":
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."

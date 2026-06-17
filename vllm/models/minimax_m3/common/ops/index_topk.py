@@ -7,7 +7,11 @@ then the top-k blocks (plus forced init/local blocks) are selected per query
 token. Adapted to vLLM's paged KV cache: the KV page size is forced to equal the
 sparse block size (128), so one sparse block maps to exactly one page.
 
-Index-K cache layout (vLLM): ``(num_blocks, 128, idx_head_dim)`` (single head).
+Index-K cache layouts (vLLM):
+
+* BF16: ``(num_blocks, 128, idx_head_dim)`` (single head).
+* FP8: ``(num_blocks, 128, idx_head_dim + 4)`` as uint8 storage. Each page
+  stores all 128-byte FP8 rows first, followed by one float32 scale per row.
 
 Only the paths MiniMax M3 uses are implemented: score_type="max", index value
 disabled (score-only indexer), single shared index head. The selected block ids
@@ -22,6 +26,73 @@ from vllm.utils.math_utils import round_up
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
+
+
+# ---------------------------------------------------------------------------
+# FP8 index-key cache insertion. The normalized index key is a strided slice
+# of M3's fused QKV projection, so this kernel consumes its real row stride
+# instead of materializing a contiguous copy before quantization.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _index_k_quant_and_cache_kernel(
+    index_k_ptr,
+    index_cache_ptr,
+    slot_mapping_ptr,
+    stride_k_n,
+    stride_k_d,
+    stride_cache_block,
+    head_dim: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx < 0:
+        return
+
+    offsets = tl.arange(0, head_dim)
+    index_k = tl.load(index_k_ptr + token_idx * stride_k_n + offsets * stride_k_d).to(
+        tl.float32
+    )
+    absmax = tl.maximum(tl.max(tl.abs(index_k), axis=0), 1e-4)
+    fp8_max: tl.constexpr = 224.0 if IS_FNUZ else 448.0
+    scale = tl.exp2(tl.ceil(tl.log2(absmax / fp8_max)))
+    scaled = index_k / scale
+    index_k_fp8 = scaled.to(tl.float8e4b15) if IS_FNUZ else scaled.to(tl.float8e4nv)
+    index_k_raw = index_k_fp8.to(tl.uint8, bitcast=True)
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+    cache_block_ptr = index_cache_ptr + block_idx.to(tl.int64) * stride_cache_block
+    tl.store(cache_block_ptr + pos_in_block * head_dim + offsets, index_k_raw)
+    scale_ptr = (cache_block_ptr + cache_block_size * head_dim + pos_in_block * 4).to(
+        tl.pointer_type(tl.float32)
+    )
+    tl.store(scale_ptr, scale)
+
+
+@torch.no_grad()
+def minimax_m3_index_k_quant_and_cache(
+    index_k: torch.Tensor,
+    index_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Quantize strided BF16 index keys into the paged FP8 index cache."""
+    assert index_k.ndim == 2 and index_k.shape[1] == 128
+    assert index_cache.ndim == 3 and index_cache.dtype == torch.uint8
+    assert index_cache.shape[2] == index_k.shape[1] + 4
+    assert slot_mapping.shape[0] <= index_k.shape[0]
+    _index_k_quant_and_cache_kernel[(slot_mapping.shape[0],)](
+        index_k,
+        index_cache,
+        slot_mapping,
+        index_k.stride(0),
+        index_k.stride(1),
+        index_cache.stride(0),
+        head_dim=index_k.shape[1],
+        cache_block_size=index_cache.shape[1],
+        IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +173,8 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    USE_FP8: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -142,13 +215,32 @@ def _index_block_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-        )
+        if USE_FP8:
+            cache_block_ptr = ik_cache_ptr + page * stride_ik_blk
+            k_raw = tl.load(
+                cache_block_ptr + off_k[None, :] * head_dim + off_d[:, None],
+            )
+            if IS_FNUZ:
+                k_fp8 = k_raw.to(tl.float8e4b15, bitcast=True)
+            else:
+                k_fp8 = k_raw.to(tl.float8e4nv, bitcast=True)
+            scale_ptrs = (cache_block_ptr + BLOCK_SIZE_K * head_dim + off_k * 4).to(
+                tl.pointer_type(tl.float32)
+            )
+            k_scale = tl.load(scale_ptrs)
+            k = k_fp8.to(tl.bfloat16)
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[None, :] * stride_ik_pos
+                + off_d[:, None] * stride_ik_d,
+            )
         qk = tl.dot(q, k) * sm_scale_log2e
+        if USE_FP8:
+            # Scale is per cached token, so applying it to the dot output is
+            # equivalent to dequantizing every K element and uses fewer ops.
+            qk *= k_scale[None, :]
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -319,6 +411,8 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     num_kv_chunks,
     USE_PDL: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_b = tl.program_id(0)  # flattened query-token id
@@ -362,13 +456,30 @@ def _decode_index_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d * stride_ik_d,
-        )  # [N,D]
+        if USE_FP8:
+            cache_block_ptr = ik_cache_ptr + page * stride_ik_blk
+            k_raw = tl.load(
+                cache_block_ptr + off_k[:, None] * head_dim + off_d[None, :],
+            )
+            if IS_FNUZ:
+                k_fp8 = k_raw.to(tl.float8e4b15, bitcast=True)
+            else:
+                k_fp8 = k_raw.to(tl.float8e4nv, bitcast=True)
+            scale_ptrs = (cache_block_ptr + BLOCK_SIZE_K * head_dim + off_k * 4).to(
+                tl.pointer_type(tl.float32)
+            )
+            k_scale = tl.load(scale_ptrs)
+            k = k_fp8.to(tl.bfloat16)
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[:, None] * stride_ik_pos
+                + off_d * stride_ik_d,
+            )  # [N,D]
         kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
+        if USE_FP8:
+            kq *= k_scale[:, None]
         kq = tl.where(pos_mask[:, None], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [H]
         is_init = blk < init_blocks
@@ -661,6 +772,10 @@ def minimax_m3_index_score(
     )
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    use_fp8 = index_kv_cache.dtype == torch.uint8
+    if use_fp8:
+        assert index_kv_cache.shape[-1] == head_dim + 4
+    is_fnuz = current_platform.fp8_dtype() == torch.float8_e4m3fnuz
 
     # Keep score strides 16-divisible to avoid Triton recompiles.
     score_block_stride = round_up(max_block, 16)
@@ -694,6 +809,8 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        USE_FP8=use_fp8,
+        IS_FNUZ=is_fnuz,
     )
     return score
 
@@ -767,6 +884,10 @@ def minimax_m3_index_decode(
     assert total_q == seq_lens.shape[0] * decode_query_len
     batch = total_q
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    use_fp8 = index_kv_cache.dtype == torch.uint8
+    if use_fp8:
+        assert index_kv_cache.shape[-1] == head_dim + 4
+    is_fnuz = current_platform.fp8_dtype() == torch.float8_e4m3fnuz
     use_pdl = current_platform.is_arch_support_pdl()
     # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
     # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
@@ -815,6 +936,8 @@ def minimax_m3_index_decode(
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         num_kv_chunks=num_kv_chunks,
         USE_PDL=use_pdl,
+        USE_FP8=use_fp8,
+        IS_FNUZ=is_fnuz,
         **pdl_launch,
     )
 
