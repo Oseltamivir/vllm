@@ -82,6 +82,19 @@ def _select_rocm_mxfp8_backend(
     """ROCm fallback when vendor MXFP8 backends are unavailable."""
 
     if current_platform.is_fp8_fnuz() and config.ep_size > 1:
+        from vllm.model_executor.layers.fused_moe.experts.mxfp8_native_moe import (
+            Mxfp8NativeTritonExperts,
+            _should_use_bf16_decode_fallback,
+        )
+
+        if _should_use_bf16_decode_fallback(config):
+            logger.info_once(
+                "Using the profiled gfx94x MiniMax-M3 EP8 MXFP8 backend: "
+                "native local-route kernels for decode and retained BF16 "
+                "experts for large prefill."
+            )
+            return Fp8MoeBackend.NATIVE_MXFP8, Mxfp8NativeTritonExperts
+
         from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
             Mxfp8EmulationTritonExperts,
         )

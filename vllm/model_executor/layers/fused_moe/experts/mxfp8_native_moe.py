@@ -46,13 +46,16 @@ _BF16_DECODE_TOKEN_THRESHOLD = 8
 # between 827 and 843 tokens on MI300X. Keep the cutoff tile-aligned.
 _BF16_PREFILL_TOKEN_THRESHOLD = 832
 _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE = 5
+_WEIGHT_STORAGE_DUAL = "dual"
+_WEIGHT_STORAGE_BF16_ONLY = "bf16_only"
+_WEIGHT_STORAGE_NATIVE_ONLY = "native_only"
 
 
 def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
-    """Limit BF16 fallback weights to the exact MiniMax-M3 TP shape."""
+    """Limit mixed BF16/native storage to profiled MiniMax-M3 shapes."""
     return (
         current_platform.is_fp8_fnuz()
-        and moe_config.ep_size == 1
+        and moe_config.ep_size in (1, 8)
         and moe_config.has_shared_experts
         and moe_config.num_experts == 128
         and moe_config.experts_per_token == 4
@@ -62,21 +65,43 @@ def _should_use_bf16_decode_fallback(moe_config: FusedMoEConfig) -> bool:
     )
 
 
-def _should_store_bf16_only(max_model_len: int, layer_index: int) -> bool:
-    return (
-        max_model_len > 4096 and layer_index % _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE == 0
-    )
+def _mxfp8_weight_storage_policy(
+    max_model_len: int,
+    layer_index: int,
+    ep_size: int,
+) -> str:
+    if max_model_len <= 4096 or layer_index % _LONG_CONTEXT_BF16_ONLY_LAYER_STRIDE != 0:
+        return _WEIGHT_STORAGE_DUAL
+    if ep_size > 1:
+        return _WEIGHT_STORAGE_NATIVE_ONLY
+    return _WEIGHT_STORAGE_BF16_ONLY
 
 
 def _should_use_bf16_experts(
     num_tokens: int,
     native_weights_available: bool,
+    bf16_weights_available: bool,
 ) -> bool:
-    return (
+    return bf16_weights_available and (
         not native_weights_available
-        or num_tokens >= _BF16_PREFILL_TOKEN_THRESHOLD
         or num_tokens <= _BF16_DECODE_TOKEN_THRESHOLD
+        or num_tokens >= _BF16_PREFILL_TOKEN_THRESHOLD
     )
+
+
+def _max_post_padded(
+    num_valid_tokens: int,
+    num_local_experts: int,
+    block_m: int,
+    allocation_size: int,
+) -> int:
+    """Static upper bound for a block-aligned local-expert route list."""
+    max_padded = min(
+        allocation_size,
+        num_valid_tokens * block_m,
+        num_valid_tokens + num_local_experts * (block_m - 1),
+    )
+    return (max_padded // block_m) * block_m
 
 
 @triton.jit
@@ -108,6 +133,7 @@ def _mxfp8_grouped_gemm_dot_scaled_kernel(
     stride_cn,
     A_DIV: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
+    FUSE_TOPK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -161,12 +187,14 @@ def _mxfp8_grouped_gemm_dot_scaled_kernel(
         w = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         acc = acc * w[:, None]
 
-    c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(
-        c_ptrs,
-        acc.to(c_ptr.dtype.element_ty),
-        mask=token_mask[:, None] & n_mask[None, :],
-    )
+    c_row = offs_token // top_k if FUSE_TOPK else offs_token
+    c_ptrs = c_ptr + c_row[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = token_mask[:, None] & n_mask[None, :]
+    result = acc.to(c_ptr.dtype.element_ty)
+    if FUSE_TOPK:
+        tl.atomic_add(c_ptrs, result, mask=c_mask, sem="relaxed")
+    else:
+        tl.store(c_ptrs, result, mask=c_mask)
 
 
 @triton.jit
@@ -198,6 +226,7 @@ def _mxfp8_grouped_gemm_fnuz_kernel(
     stride_cn,
     A_DIV: tl.constexpr,
     MUL_WEIGHT: tl.constexpr,
+    FUSE_TOPK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -271,12 +300,14 @@ def _mxfp8_grouped_gemm_fnuz_kernel(
         w = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0)
         acc = acc * w[:, None]
 
-    c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    tl.store(
-        c_ptrs,
-        acc.to(c_ptr.dtype.element_ty),
-        mask=token_mask[:, None] & n_mask[None, :],
-    )
+    c_row = offs_token // top_k if FUSE_TOPK else offs_token
+    c_ptrs = c_ptr + c_row[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = token_mask[:, None] & n_mask[None, :]
+    result = acc.to(c_ptr.dtype.element_ty)
+    if FUSE_TOPK:
+        tl.atomic_add(c_ptrs, result, mask=c_mask, sem="relaxed")
+    else:
+        tl.store(c_ptrs, result, mask=c_mask)
 
 
 def _gfx94x_grouped_gemm_config(
@@ -330,6 +361,9 @@ def _grouped_gemm_mxfp8(
     block_n_override: int = 0,
     block_k_override: int = 0,
     num_warps_override: int = 0,
+    output: torch.Tensor | None = None,
+    fuse_topk: bool = False,
+    zero_nonlocal_output: bool = True,
 ) -> torch.Tensor:
     M_routed = num_valid_tokens
     E, N, K = w.shape
@@ -363,12 +397,15 @@ def _grouped_gemm_mxfp8(
         BLOCK_N = 128
         BLOCK_K = 128
         num_warps = 8
-    # moe_align_block_size allocates for the worst case where every expert is
-    # active. At small batches that can be much larger than the number of
-    # blocks that can contain valid assignments. Limit the launch to the
-    # tighter static upper bound; the device-side num_post check handles the
-    # remaining tail.
-    max_post_padded = min(sorted_token_ids.shape[0], M_routed * block_m)
+    # With EP, the align buffer is sized from the global expert count even
+    # though only local assignments survive. Bound the launch by the local
+    # expert count; the device-side num_post check handles the remaining tail.
+    max_post_padded = _max_post_padded(
+        M_routed,
+        E,
+        block_m,
+        sorted_token_ids.shape[0],
+    )
     if block_n_override:
         BLOCK_N = block_n_override
     if block_k_override:
@@ -385,11 +422,32 @@ def _grouped_gemm_mxfp8(
     m_blocks = triton.cdiv(max_post_padded, block_m)
     n_blocks = triton.cdiv(N, BLOCK_N)
 
-    # Under expert parallelism (expert_map set) tokens routed to non-local
-    # experts are dropped from sorted_token_ids, so their output rows are never
-    # written.
-    alloc = torch.zeros if expert_map is not None else torch.empty
-    out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
+    if fuse_topk:
+        if M_routed % top_k != 0:
+            raise ValueError(
+                f"Routed rows ({M_routed}) must be divisible by top_k ({top_k})."
+            )
+        expected_shape = (M_routed // top_k, N)
+        if output is None:
+            out = torch.zeros(expected_shape, dtype=out_dtype, device=a_q.device)
+        else:
+            if output.shape != expected_shape or output.dtype != out_dtype:
+                raise ValueError(
+                    "Fused top-k output must have shape/dtype "
+                    f"{expected_shape}/{out_dtype}, got "
+                    f"{tuple(output.shape)}/{output.dtype}."
+                )
+            out = output
+            out.zero_()
+    else:
+        # EP rows that route to remote experts are unwritten. Dense consumers
+        # need zeros; route-aware consumers can skip the memset.
+        alloc = (
+            torch.zeros
+            if expert_map is not None and zero_nonlocal_output
+            else torch.empty
+        )
+        out = alloc((M_routed, N), dtype=out_dtype, device=a_q.device)
     grid = (m_blocks, n_blocks)
     kernel = (
         _mxfp8_grouped_gemm_fnuz_kernel
@@ -428,6 +486,7 @@ def _grouped_gemm_mxfp8(
         out.stride(1),
         A_DIV=a_div,
         MUL_WEIGHT=mul_weight_by is not None,
+        FUSE_TOPK=fuse_topk,
         BLOCK_M=block_m,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -477,6 +536,7 @@ def fused_moe_mxfp8_native(
         expert_map,
         ignore_invalid_experts=expert_map is not None,
     )
+    use_sparse_ep_path = expert_map is not None and current_platform.is_fp8_fnuz()
 
     # GEMM1: x (mxfp8) @ w13^T -> [M, 2I]
     a_q, a_s = mxfp8_e4m3_quantize(hidden_states)
@@ -497,6 +557,7 @@ def fused_moe_mxfp8_native(
         block_n_override=g1_block_n,
         block_k_override=g1_block_k,
         num_warps_override=g1_num_warps,
+        zero_nonlocal_output=not use_sparse_ep_path,
     )  # [M, 2I]
 
     # SwiGLU-OAI (split layout: gate=g1[:, :I], up=g1[:, I:]) FUSED with the
@@ -506,10 +567,62 @@ def fused_moe_mxfp8_native(
     # ``silu_and_mul_with_clamp`` op: it rounds intermediates to bf16, rel ~3e-3.)
     # Lazy import: the amd.ops package pulls in the minimax_m3 platform dispatch,
     # only resolvable after the model module finishes loading.
-    from vllm.models.minimax_m3.amd.ops import swiglu_oai_quantize_mxfp8
+    from vllm.models.minimax_m3.amd.ops import (
+        swiglu_oai_quantize_mxfp8,
+        swiglu_oai_quantize_mxfp8_routed,
+    )
 
     # GEMM2: act (mxfp8) @ w2^T -> [M, H], weighted by topk_weights, then reduce.
-    act_q, act_s = swiglu_oai_quantize_mxfp8(g1, alpha=alpha, beta=beta, limit=limit)
+    if use_sparse_ep_path:
+        max_post_padded = _max_post_padded(
+            M,
+            w13.shape[0],
+            block_m,
+            sorted_ids.shape[0],
+        )
+        act_q, act_s = swiglu_oai_quantize_mxfp8_routed(
+            g1,
+            sorted_ids,
+            num_post,
+            num_valid_tokens=M,
+            max_num_tokens_post_padded=max_post_padded,
+            alpha=alpha,
+            beta=beta,
+            limit=limit,
+            block_m=block_m,
+        )
+    else:
+        act_q, act_s = swiglu_oai_quantize_mxfp8(
+            g1,
+            alpha=alpha,
+            beta=beta,
+            limit=limit,
+        )
+
+    if use_sparse_ep_path:
+        return _grouped_gemm_mxfp8(
+            act_q,
+            act_s,
+            w2,
+            w2_scale,
+            sorted_ids,
+            expert_ids,
+            num_post,
+            M,
+            top_k,
+            block_m,
+            hidden_states.dtype,
+            a_div=1,
+            mul_weight_by=topk_weights.reshape(-1).to(torch.float32),
+            expert_map=expert_map,
+            is_gemm2=True,
+            block_n_override=g2_block_n,
+            block_k_override=g2_block_k,
+            num_warps_override=g2_num_warps,
+            output=output,
+            fuse_topk=True,
+        )
+
     g2 = _grouped_gemm_mxfp8(
         act_q,
         act_s,
@@ -556,6 +669,7 @@ class Mxfp8NativeTritonExperts(Mxfp8TritonExpertsBase):
         self.w1_bf16: torch.Tensor | None = None
         self.w2_bf16: torch.Tensor | None = None
         self.native_weights_available = True
+        self.bf16_weights_available = False
         self.bf16_experts: TritonExperts | None = None
         if _should_use_bf16_decode_fallback(moe_config):
             bf16_config = biased_moe_quant_config(
@@ -583,6 +697,7 @@ class Mxfp8NativeTritonExperts(Mxfp8TritonExpertsBase):
         self.w1_bf16 = w1_bf16
         self.w2_bf16 = w2_bf16
         self.native_weights_available = native_weights_available
+        self.bf16_weights_available = True
 
     def bind_packed_weight_scales(
         self,
@@ -636,6 +751,7 @@ class Mxfp8NativeTritonExperts(Mxfp8TritonExpertsBase):
         if bf16_experts is not None and _should_use_bf16_experts(
             num_tokens,
             self.native_weights_available,
+            self.bf16_weights_available,
         ):
             if self.w1_bf16 is None or self.w2_bf16 is None:
                 raise RuntimeError(
