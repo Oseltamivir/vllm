@@ -30,12 +30,16 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
     fused_allreduce_gemma_rms_norm,
+    initialize_aiter_fused_allreduce_gemma_rms_norm,
 )
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -204,6 +208,7 @@ class MiniMaxM3MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.reduce_results = reduce_results
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size] * 2,
@@ -244,6 +249,10 @@ class MiniMaxM3MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
+    @property
+    def output_is_reduced(self) -> bool:
+        return self.reduce_results
+
 
 class MiniMaxM3MoE(nn.Module):
     """Sigmoid-routed MoE block with a routing-bias correction and a shared
@@ -254,6 +263,7 @@ class MiniMaxM3MoE(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
+        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -317,6 +327,7 @@ class MiniMaxM3MoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
+            runner_args={"reduce_results": reduce_results},
             prefix=f"{prefix}.experts",
         )
 
@@ -336,6 +347,10 @@ class MiniMaxM3MoE(nn.Module):
         )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    @property
+    def output_is_reduced(self) -> bool:
+        return self.experts.output_is_reduced
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -671,6 +686,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         force_sparse_attn: bool = False,
         force_moe: bool = False,
+        reduce_ffn_results: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -708,6 +724,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
+                reduce_results=reduce_ffn_results,
                 prefix=f"{prefix}.block_sparse_moe",
             )
         else:
@@ -715,6 +732,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
                 quant_config=quant_config,
+                reduce_results=reduce_ffn_results,
                 prefix=f"{prefix}.mlp",
             )
 
@@ -731,11 +749,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        input_is_reduced: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif not input_is_reduced:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
@@ -750,6 +773,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
 
+    @property
+    def ffn_output_is_reduced(self) -> bool:
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        return ffn.output_is_reduced
+
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
@@ -761,6 +789,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
+        aiter_fused_norm_ready = initialize_aiter_fused_allreduce_gemma_rms_norm()
+        self.defer_ffn_allreduce = (
+            aiter_fused_norm_ready
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and vllm_config.parallel_config.data_parallel_size == 1
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -778,6 +812,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 prefix,
                 cache_config=cache_config,
                 quant_config=quant_config,
+                reduce_ffn_results=not self.defer_ffn_allreduce,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -798,16 +833,35 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             hidden_states = self.embed_input_ids(input_ids)
         residual = None
+        hidden_states_are_reduced = True
 
         # EAGLE3 is not yet compatible with pipeline parallel
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                input_is_reduced=hidden_states_are_reduced,
+            )
+            hidden_states_are_reduced = layer.ffn_output_is_reduced
+            if (
+                not hidden_states_are_reduced
+                and idx + 1 in self.aux_hidden_state_layers
+            ):
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states_are_reduced = True
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if hidden_states_are_reduced:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            assert residual is not None
+            hidden_states, _ = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.norm
+            )
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
