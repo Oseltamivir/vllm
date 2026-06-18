@@ -9,6 +9,7 @@ from vllm import _custom_ops as ops
 from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
 )
+from vllm.models.minimax_m3.common.ops import index_topk as index_topk_ops
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode,
     minimax_m3_index_score,
@@ -124,6 +125,80 @@ def test_sparse_kernels_recognize_fp8_dtypes(dtype: torch.dtype):
 
 
 # Index top-k kernels.
+@pytest.mark.parametrize(
+    ("batch", "max_block", "use_gfx942_splits", "expected"),
+    [
+        (1, 8, True, 8),
+        (1, 64, False, 64),
+        (16, 8, False, 8),
+        (16, 64, True, 32),
+        (256, 8, False, 2),
+        (256, 8, True, 1),
+        (256, 64, True, 8),
+        (256, 256, True, 32),
+    ],
+)
+def test_decode_index_score_split_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: int,
+    max_block: int,
+    use_gfx942_splits: bool,
+    expected: int,
+):
+    monkeypatch.setattr(
+        index_topk_ops,
+        "_use_gfx942_high_batch_score_splits",
+        lambda: use_gfx942_splits,
+    )
+    assert index_topk_ops._decode_score_num_kv_chunks(batch, max_block) == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "batch",
+        "num_idx_heads",
+        "head_dim",
+        "decode_query_len",
+        "max_decode_query_len",
+        "use_gfx942",
+        "expected",
+    ),
+    [
+        (256, 1, 128, 1, 1, True, True),
+        (16, 1, 128, 1, 1, True, False),
+        (256, 4, 128, 1, 1, True, False),
+        (256, 1, 64, 1, 1, True, False),
+        (256, 1, 128, 1, 4, True, False),
+        (256, 1, 128, 1, 1, False, False),
+    ],
+)
+def test_decode_index_score_vector_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: int,
+    num_idx_heads: int,
+    head_dim: int,
+    decode_query_len: int,
+    max_decode_query_len: int,
+    use_gfx942: bool,
+    expected: bool,
+):
+    monkeypatch.setattr(
+        index_topk_ops,
+        "_use_gfx942_high_batch_score_splits",
+        lambda: use_gfx942,
+    )
+    assert (
+        index_topk_ops._use_gfx942_decode_score_vector(
+            batch,
+            num_idx_heads,
+            head_dim,
+            decode_query_len,
+            max_decode_query_len,
+        )
+        is expected
+    )
+
+
 def _reference_index_topk(
     idx_q: torch.Tensor,
     index_kv_cache: torch.Tensor,
@@ -309,6 +384,86 @@ def test_decode_index_topk_correctness(
         block_table[:active_batch],
         q_lens,
         active_seq_lens,
+        prefix_lens,
+        topk,
+        init_blocks,
+        local_blocks,
+    )
+    _assert_topk_indices_equal_unordered(actual, expected)
+
+
+def test_decode_index_topk_gfx942_vector_correctness(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        index_topk_ops,
+        "_use_gfx942_high_batch_score_splits",
+        lambda: True,
+    )
+    topk = 6
+    init_blocks = 1
+    local_blocks = 3
+    batch = 128
+    num_idx_heads = 1
+    head_dim = 128
+    seq_lens = torch.tensor(
+        [7, 129, 257, 1025] * (batch // 4),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_lens = torch.ones_like(seq_lens)
+    prefix_lens = seq_lens - 1
+    max_seq_len = seq_lens.max().item()
+    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_pages = batch * max_blocks
+
+    block_table = torch.randperm(
+        num_pages,
+        device="cuda",
+        dtype=torch.int32,
+    ).reshape(batch, max_blocks)
+    idx_q = torch.ones(
+        batch,
+        num_idx_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    index_kv_cache = torch.empty(
+        num_pages,
+        BLOCK_SIZE,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    logical_values = (
+        torch.arange(max_blocks, device="cuda", dtype=torch.float32)
+        .repeat(batch)
+        .add_(1)
+        .div_(32)
+        .to(torch.bfloat16)
+    )
+    index_kv_cache[block_table.flatten()] = logical_values[:, None, None]
+
+    actual = minimax_m3_index_decode(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_seq_len=max_seq_len,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        num_kv_heads=num_idx_heads,
+        decode_query_len=1,
+        max_decode_query_len=1,
+    )
+    expected = _reference_index_topk(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        q_lens,
+        seq_lens,
         prefix_lens,
         topk,
         init_blocks,
