@@ -254,6 +254,7 @@ class MoERunner(MoERunnerInterface):
         routed_input_transform: torch.nn.Module | None = None,
         routed_output_transform: torch.nn.Module | None = None,
         routed_scaling_factor: float = 1.0,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.moe_config = moe_config
@@ -261,6 +262,7 @@ class MoERunner(MoERunnerInterface):
         self.routed_input_transform = routed_input_transform
         self.routed_output_transform = routed_output_transform
         self.routed_scaling_factor = routed_scaling_factor
+        self.reduce_results = reduce_results
         self.gate = gate
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
@@ -408,6 +410,15 @@ class MoERunner(MoERunnerInterface):
             and self._quant_method.moe_kernel.output_is_reduced()
         )
 
+    @property
+    def output_is_reduced(self) -> bool:
+        """Whether forward returns an output complete across TP/EP ranks."""
+        return (
+            self.moe_config.is_sequence_parallel
+            or self._fused_output_is_reduced
+            or self.reduce_results
+        )
+
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
@@ -444,7 +455,8 @@ class MoERunner(MoERunnerInterface):
         # - We are not running with TP or DP
         # - The MK already reduced the fused output itself.
         if (
-            not self.moe_config.is_sequence_parallel
+            self.reduce_results
+            and not self.moe_config.is_sequence_parallel
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
