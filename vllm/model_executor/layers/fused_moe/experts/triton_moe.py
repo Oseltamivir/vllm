@@ -24,6 +24,9 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import (
+    moe_fused_mul_sum,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -51,6 +54,26 @@ from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
+def _use_minimax_m3_mi300x_ep_route_compaction(
+    moe_config: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig,
+) -> bool:
+    """Match the profiled MiniMax M3 block-FP8 EP8 shape on gfx942."""
+    return (
+        current_platform.is_fp8_fnuz()
+        and moe_config.ep_size == 8
+        and moe_config.num_experts == 128
+        and moe_config.num_local_experts == 16
+        and moe_config.experts_per_token == 4
+        and moe_config.hidden_dim == 6144
+        and moe_config.intermediate_size_per_partition == 3072
+        and moe_config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        and not moe_config.is_lora_enabled
+        and quant_config.use_fp8_w8a8
+        and quant_config.block_shape == [128, 128]
+    )
+
+
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
@@ -71,6 +94,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         )
         self.gemm1_beta = (
             quant_config.gemm1_beta if quant_config.gemm1_beta is not None else 0.0
+        )
+        self.compact_minimax_m3_mi300x_ep_routes = (
+            _use_minimax_m3_mi300x_ep_route_compaction(moe_config, quant_config)
         )
 
     @staticmethod
@@ -226,6 +252,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
+        compact_ep_routes = (
+            self.compact_minimax_m3_mi300x_ep_routes and expert_map is not None
+        )
 
         if global_num_experts == -1:
             global_num_experts = E
@@ -272,6 +301,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 use_int8_w8a16=self.quant_config.use_int8_w8a16,
                 use_int4_w4a16=self.quant_config.use_int4_w4a16,
                 block_shape=self.block_shape,
+                ignore_invalid_experts=compact_ep_routes,
+                num_local_experts=E if compact_ep_routes else None,
             )
         )
 
@@ -476,8 +507,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     top_k_num=top_k_num,
                 )
 
-        # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output)
+        if compact_ep_routes:
+            moe_fused_mul_sum(
+                intermediate_cache3,
+                topk_weights,
+                outputs=output,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+                apply_weights=False,
+            )
+        else:
+            # separate function is required for MoE + LoRA
+            self.moe_sum(intermediate_cache3, output)
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         ops.moe_sum(input, output)

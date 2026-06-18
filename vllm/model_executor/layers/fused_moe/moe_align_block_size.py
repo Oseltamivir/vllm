@@ -15,6 +15,7 @@ def moe_align_block_size(
     expert_map: torch.Tensor | None = None,
     pad_sorted_ids: bool = False,
     ignore_invalid_experts: bool = False,
+    num_local_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -43,6 +44,9 @@ def moe_align_block_size(
         as -1. When True, all invalid expert_ids in topk_ids will be ignored
         and will not participate in counting or ranking, and there will be no
         -1 in expert_ids.
+    - num_local_experts: The number of experts retained by ``expert_map``.
+        When invalid experts are ignored, this tightens the output allocation
+        from the global expert count to the local expert count.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -71,7 +75,20 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    padding_experts = num_experts
+    if (
+        ignore_invalid_experts
+        and expert_map is not None
+        and num_local_experts is not None
+    ):
+        if not 0 < num_local_experts <= num_experts:
+            raise ValueError(
+                "num_local_experts must be in (0, num_experts], got "
+                f"{num_local_experts} for num_experts={num_experts}."
+            )
+        padding_experts = num_local_experts
+
+    max_num_tokens_padded = topk_ids.numel() + padding_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
     if topk_ids.numel() < num_experts:

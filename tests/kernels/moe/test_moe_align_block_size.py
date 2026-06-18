@@ -95,6 +95,7 @@ def torch_moe_align_block_size(
     num_experts: int,
     expert_map: torch.Tensor | None = None,
     pad_sorted_ids: bool = False,
+    num_local_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Golden torch implementation of moe_align_block_size.
@@ -103,11 +104,14 @@ def torch_moe_align_block_size(
     with block size for matrix multiplication by sorting tokens by expert and
     padding to block boundaries.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    padding_experts = num_experts if num_local_experts is None else num_local_experts
+    max_num_tokens_padded = topk_ids.numel() + padding_experts * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
     if topk_ids.numel() < num_experts:
-        max_num_tokens_padded = topk_ids.numel() * block_size
+        max_num_tokens_padded = min(
+            topk_ids.numel() * block_size, max_num_tokens_padded
+        )
 
     flattened_token_indices = torch.arange(
         topk_ids.numel(), device=topk_ids.device, dtype=torch.int32
@@ -242,7 +246,7 @@ def test_moe_align_block_size(
     ).all(), "expert_ids should contain valid expert indices"
 
 
-@pytest.mark.parametrize("m", [16, 32, 2048])
+@pytest.mark.parametrize("m", [16, 24, 32, 2048])
 @pytest.mark.parametrize("topk", [2, 4])
 @pytest.mark.parametrize("num_experts", [8, 64])
 @pytest.mark.parametrize("block_size", [64])
@@ -266,6 +270,7 @@ def test_moe_align_block_size_with_expert_map(
         num_experts=num_experts,
         expert_map=expert_map,
         ignore_invalid_experts=True,
+        num_local_experts=len(local_experts),
     )
     golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
         torch_moe_align_block_size(
@@ -273,6 +278,7 @@ def test_moe_align_block_size_with_expert_map(
             block_size=block_size,
             num_experts=num_experts,
             expert_map=expert_map,
+            num_local_experts=len(local_experts),
         )
     )
 
