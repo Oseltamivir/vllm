@@ -53,6 +53,7 @@ IS_AITER_FOUND = is_aiter_found()
 
 
 class AiterCustomAllreduceProto(Protocol):
+    disabled: bool
     max_size: int
     world_size: int
     fully_connected: bool
@@ -69,6 +70,7 @@ class AiterCustomAllreduceProto(Protocol):
         eps: float,
         registered: bool = False,
         use_1stage: bool = False,
+        gemma_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
     def fused_ar_rms_per_group_quant(
         self,
@@ -819,11 +821,13 @@ def _rocm_aiter_rmsnorm_fused_dynamic_quant_fake(
     return out, y_scale
 
 
-def _rocm_aiter_fused_allreduce_rmsnorm_impl(
+def _rocm_aiter_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
+    *,
+    gemma_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
@@ -851,16 +855,58 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
 
     use_1stage = hidden_ok and token_ok and size_ok
 
-    result = aiter_ar.fused_ar_rms(
-        input_,
-        residual,
-        w=weight,
-        eps=epsilon,
-        registered=torch.cuda.is_current_stream_capturing(),
-        use_1stage=use_1stage,
-    )
+    if gemma_norm:
+        result = aiter_ar.fused_ar_rms(
+            input_,
+            residual,
+            w=weight,
+            eps=epsilon,
+            registered=torch.cuda.is_current_stream_capturing(),
+            use_1stage=use_1stage,
+            gemma_norm=True,
+        )
+    else:
+        # Keep the legacy call signature for older AITER builds.
+        result = aiter_ar.fused_ar_rms(
+            input_,
+            residual,
+            w=weight,
+            eps=epsilon,
+            registered=torch.cuda.is_current_stream_capturing(),
+            use_1stage=use_1stage,
+        )
     assert result is not None
     return result[0], result[1]
+
+
+def _rocm_aiter_fused_allreduce_rmsnorm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _rocm_aiter_fused_allreduce_rmsnorm(
+        input_,
+        residual,
+        weight,
+        epsilon,
+        gemma_norm=False,
+    )
+
+
+def _rocm_aiter_fused_allreduce_gemma_rmsnorm_impl(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _rocm_aiter_fused_allreduce_rmsnorm(
+        input_,
+        residual,
+        weight,
+        epsilon,
+        gemma_norm=True,
+    )
 
 
 def _rocm_aiter_fused_allreduce_rmsnorm_fake(
@@ -1457,6 +1503,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER: Main toggle for all AITER operations.
         VLLM_ROCM_USE_AITER_LINEAR: Controls GEMM and quantization ops.
         VLLM_ROCM_USE_AITER_RMSNORM: Controls RMSNorm operations.
+        VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM: Controls only the
+            fused all-reduce + Gemma RMSNorm operation.
         VLLM_ROCM_USE_AITER_MOE: Controls MoE (Mixture of Experts) ops.
         VLLM_ROCM_USE_AITER_MLA: Controls MLA (Multi-head Latent Attention) ops.
         VLLM_ROCM_USE_AITER_MHA: Controls MHA ops including flash_attn_varlen.
@@ -1519,6 +1567,9 @@ class rocm_aiter_ops:
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
+    _FUSED_ALLREDUCE_GEMMA_RMSNORM_ENABLED = (
+        envs.VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM
+    )
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
     _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
@@ -1537,9 +1588,11 @@ class rocm_aiter_ops:
     # Lazily probed: whether aiter.topk_softmax supports the
     # num_shared_experts / shared_expert_scoring_func args (7-arg form).
     _TOPK_SOFTMAX_FUSED_SIGMOID: bool | None = None
+    _FUSED_ALLREDUCE_GEMMA_RMSNORM_SUPPORTED: bool | None = None
 
     _ALL_REDUCE_MAX_SIZE: int = 8192 * 1024 * 8 * 2
     _CUSTOM_ALL_REDUCE: AiterCustomAllreduceProto | None = None
+    _CUSTOM_ALL_REDUCE_INIT_ATTEMPTED = False
 
     @classmethod
     def refresh_env_variables(cls):
@@ -1553,6 +1606,9 @@ class rocm_aiter_ops:
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
+        cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_ENABLED = (
+            envs.VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM
+        )
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
         cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
@@ -1648,6 +1704,33 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_fused_moe_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def has_fused_allreduce_gemma_rmsnorm(cls) -> bool:
+        if cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_SUPPORTED is None:
+            try:
+                import inspect
+
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce as AiterCustomAllreduce,
+                )
+
+                cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_SUPPORTED = (
+                    "gemma_norm"
+                    in inspect.signature(AiterCustomAllreduce.fused_ar_rms).parameters
+                )
+            except (ImportError, AttributeError, TypeError, ValueError):
+                cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_SUPPORTED = False
+        return cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_SUPPORTED
+
+    @classmethod
+    @if_aiter_supported
+    def is_fused_allreduce_gemma_rmsnorm_enabled(cls) -> bool:
+        return (
+            cls._FUSED_ALLREDUCE_GEMMA_RMSNORM_ENABLED
+            and cls.has_fused_allreduce_gemma_rmsnorm()
+        )
 
     @classmethod
     @if_aiter_supported
@@ -1767,12 +1850,19 @@ class rocm_aiter_ops:
     def initialize_aiter_allreduce(
         cls, group: ProcessGroup, device: torch.device
     ) -> None:
+        if cls._CUSTOM_ALL_REDUCE_INIT_ATTEMPTED:
+            return
+        cls._CUSTOM_ALL_REDUCE_INIT_ATTEMPTED = True
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            cls._CUSTOM_ALL_REDUCE = AiterCustomAllreduce(group, device)
+            cls._CUSTOM_ALL_REDUCE = AiterCustomAllreduce(
+                group,
+                device,
+                max_size=cls._ALL_REDUCE_MAX_SIZE,
+            )
         except Exception:
             cls._CUSTOM_ALL_REDUCE = None
 
@@ -1785,6 +1875,7 @@ class rocm_aiter_ops:
         if cls._CUSTOM_ALL_REDUCE is not None:
             cls._CUSTOM_ALL_REDUCE.close()
             cls._CUSTOM_ALL_REDUCE = None
+        cls._CUSTOM_ALL_REDUCE_INIT_ATTEMPTED = False
 
     @classmethod
     def get_aiter_allreduce_max_size(cls) -> int | None:
@@ -2025,6 +2116,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_gemma_rmsnorm",
+                op_func=_rocm_aiter_fused_allreduce_gemma_rmsnorm_impl,
+                fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_fused_allreduce_rmsnorm_quant_per_group",
                 op_func=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_impl),
                 fake_impl=(_rocm_aiter_fused_allreduce_rmsnorm_quant_per_group_fake),
@@ -2089,6 +2186,10 @@ class rocm_aiter_ops:
     @staticmethod
     def get_fused_allreduce_rmsnorm_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm.default
+
+    @staticmethod
+    def get_fused_allreduce_gemma_rmsnorm_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_gemma_rmsnorm.default
 
     @staticmethod
     def get_fused_allreduce_rmsnorm_quant_per_group_op() -> OpOverload:
