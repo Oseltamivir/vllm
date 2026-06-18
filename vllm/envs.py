@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
+    VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM: bool = False
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
@@ -1162,6 +1163,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in ("true", "1")
+    ),
+    # Use only AITER's fused tensor-parallel all-reduce + Gemma RMSNorm.
+    # This switch is independent of VLLM_ROCM_USE_AITER so models can opt in
+    # without enabling AITER attention, GEMM, or MoE kernels.
+    "VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_GEMMA_RMSNORM", "False").lower()
+        in ("true", "1")
     ),
     # Whether to use aiter mla ops.
     # By default is enabled.

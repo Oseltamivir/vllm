@@ -8,10 +8,9 @@ into a ``GemmaRMSNorm`` that adds the residual and normalizes. flashinfer ships 
 kernel that fuses all-reduce + residual-add + RMSNorm into a single launch; this
 helper drives it directly (no torch.compile pass) for models that run eager.
 
-Scope: attention output only, no quantization. When the flashinfer fast path is
-not applicable (TP==1, flashinfer/NVSwitch unavailable, unsupported dtype, or an
-oversize batch) it falls back to ``all_reduce`` + ``GemmaRMSNorm``, which is
-numerically identical to the unfused model path.
+When the platform-specific fast path is not applicable it falls back to
+``all_reduce`` + ``GemmaRMSNorm``, which is numerically identical to the
+unfused model path.
 """
 
 import torch
@@ -22,7 +21,11 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 MiB = 1024 * 1024
 
@@ -50,6 +53,62 @@ except ImportError:
 
 
 _FI_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def initialize_aiter_fused_allreduce_gemma_rms_norm() -> bool:
+    """Initialize the opt-in AITER communicator before graph capture."""
+    if not current_platform.is_rocm() or get_tensor_model_parallel_world_size() == 1:
+        return False
+
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_fused_allreduce_gemma_rmsnorm_enabled():
+        return False
+    if rocm_aiter_ops.get_aiter_allreduce() is None:
+        device_index = torch.accelerator.current_device_index()
+        device = torch.device("cuda", 0 if device_index is None else device_index)
+        rocm_aiter_ops.initialize_aiter_allreduce(get_tp_group().cpu_group, device)
+
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    if aiter_ar is None or aiter_ar.disabled:
+        logger.warning_once(
+            "AITER fused all-reduce + Gemma RMSNorm was requested but its "
+            "communicator could not be initialized; using the unfused path."
+        )
+        return False
+    return True
+
+
+def _can_use_aiter(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> bool:
+    if (
+        not current_platform.is_rocm()
+        or not hidden_states.is_cuda
+        or hidden_states.dtype not in _FI_SUPPORTED_DTYPES
+        or hidden_states.dim() != 2
+        or not hidden_states.is_contiguous()
+        or residual.shape != hidden_states.shape
+        or residual.dtype != hidden_states.dtype
+        or not residual.is_contiguous()
+        or norm.weight.shape != (hidden_states.shape[-1],)
+        or norm.weight.dtype != hidden_states.dtype
+        or not norm.weight.is_contiguous()
+    ):
+        return False
+
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    if not rocm_aiter_ops.is_fused_allreduce_gemma_rmsnorm_enabled():
+        return False
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    return bool(
+        aiter_ar is not None
+        and not aiter_ar.disabled
+        and aiter_ar.should_custom_ar(hidden_states)
+    )
 
 
 def _max_token_num(tp_size: int, hidden_size: int, dtype: torch.dtype) -> int | None:
@@ -116,6 +175,16 @@ def fused_allreduce_gemma_rms_norm(
     if tp_size == 1:
         # No all-reduce needed; identical to the unfused path.
         return norm(hidden_states, residual)
+
+    if _can_use_aiter(hidden_states, residual, norm):
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        return rocm_aiter_ops.get_fused_allreduce_gemma_rmsnorm_op()(
+            input_=hidden_states,
+            residual=residual,
+            weight=norm.weight,
+            epsilon=norm.variance_epsilon,
+        )
 
     ok, max_token_num = _can_use_flashinfer(hidden_states, tp_size)
     if ok:

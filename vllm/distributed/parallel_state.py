@@ -590,7 +590,9 @@ class GroupCoordinator:
 
             from vllm._aiter_ops import rocm_aiter_ops
 
-            if rocm_aiter_ops.is_enabled():
+            if rocm_aiter_ops.is_enabled() or (
+                rocm_aiter_ops.is_fused_allreduce_gemma_rmsnorm_enabled()
+            ):
                 aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
                 if aiter_ar is not None:
                     maybe_aiter_context = aiter_ar.capture()  # type: ignore
@@ -2010,6 +2012,13 @@ def destroy_model_parallel():
     global _TP
 
     if _TP:
+        from vllm.platforms import current_platform
+
+        if current_platform.is_rocm():
+            with contextlib.suppress(Exception):
+                from vllm._aiter_ops import rocm_aiter_ops
+
+                rocm_aiter_ops.destroy_aiter_allreduce()
         _TP.destroy()
     _TP = None
 

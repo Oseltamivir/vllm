@@ -8,10 +8,14 @@ path (TP>1 with flashinfer + NVSwitch) and on the eager fallback (TP==1, or when
 flashinfer is unavailable / the GPU has no NVSwitch).
 """
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.multiprocessing import spawn
 
+import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_module
 from tests.utils import ensure_current_vllm_config, init_test_distributed_environment
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
@@ -22,6 +26,45 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.torch_utils import set_random_seed
+
+
+def test_aiter_gemma_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    hidden_states = torch.randn(2, 16)
+    residual = torch.randn_like(hidden_states)
+    norm = GemmaRMSNorm(16, eps=1e-6)
+    expected = (torch.randn_like(hidden_states), torch.randn_like(hidden_states))
+    calls = []
+
+    def _op(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    fake_rocm_aiter_ops = SimpleNamespace(
+        get_fused_allreduce_gemma_rmsnorm_op=lambda: _op
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm._aiter_ops",
+        SimpleNamespace(rocm_aiter_ops=fake_rocm_aiter_ops),
+    )
+    monkeypatch.setattr(
+        fused_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(fused_module, "_can_use_aiter", lambda *_args: True)
+
+    output = fused_allreduce_gemma_rms_norm(hidden_states, residual, norm)
+
+    assert output is expected
+    assert calls == [
+        {
+            "input_": hidden_states,
+            "residual": residual,
+            "weight": norm.weight,
+            "epsilon": norm.variance_epsilon,
+        }
+    ]
 
 
 @ensure_current_vllm_config()
