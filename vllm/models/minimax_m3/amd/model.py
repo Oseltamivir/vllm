@@ -709,9 +709,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         force_sparse_attn: bool = False,
         force_moe: bool = False,
         reduce_ffn_results: bool = True,
+        use_aiter_fused_norm: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.use_aiter_fused_norm = use_aiter_fused_norm
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_id = int(prefix.split(sep=".")[-1])
@@ -779,7 +781,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         elif not input_is_reduced:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                allow_aiter=self.use_aiter_fused_norm,
             )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -789,7 +794,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
 
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+            hidden_states,
+            residual,
+            self.post_attention_layernorm,
+            allow_aiter=self.use_aiter_fused_norm,
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
@@ -811,9 +819,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
-        aiter_fused_norm_ready = initialize_aiter_fused_allreduce_gemma_rms_norm()
+        self.use_aiter_fused_norm = (
+            not vllm_config.parallel_config.enable_expert_parallel
+            and initialize_aiter_fused_allreduce_gemma_rms_norm()
+        )
         self.defer_ffn_allreduce = (
-            aiter_fused_norm_ready
+            self.use_aiter_fused_norm
             and vllm_config.parallel_config.pipeline_parallel_size == 1
             and vllm_config.parallel_config.data_parallel_size == 1
         )
@@ -836,6 +847,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 reduce_ffn_results=not self.defer_ffn_allreduce,
+                use_aiter_fused_norm=self.use_aiter_fused_norm,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -883,7 +895,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             assert residual is not None
             hidden_states, _ = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.norm
+                hidden_states,
+                residual,
+                self.norm,
+                allow_aiter=self.use_aiter_fused_norm,
             )
 
         if len(aux_hidden_states) > 0:

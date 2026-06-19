@@ -189,6 +189,8 @@ def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
+    *,
+    allow_aiter: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-reduce ``hidden_states`` + add ``residual`` + GemmaRMSNorm, fused.
 
@@ -202,7 +204,7 @@ def fused_allreduce_gemma_rms_norm(
         # No all-reduce needed; identical to the unfused path.
         return norm(hidden_states, residual)
 
-    if _can_use_aiter(hidden_states, residual, norm):
+    if allow_aiter and _can_use_aiter(hidden_states, residual, norm):
         from vllm._aiter_ops import rocm_aiter_ops
 
         return rocm_aiter_ops.get_fused_allreduce_gemma_rmsnorm_op()(

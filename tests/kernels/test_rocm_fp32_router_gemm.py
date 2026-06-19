@@ -51,7 +51,7 @@ def test_rocm_fp32_router_gemm_graph_capture() -> None:
     )
     router_weight = torch.randn(128, 6144, device="cuda", dtype=torch.float32) * 0.01
     rocm_fp32_router_gemm(hidden_states, router_weight)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -60,7 +60,7 @@ def test_rocm_fp32_router_gemm_graph_capture() -> None:
             router_weight,
         )
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     reference = torch.nn.functional.linear(hidden_states.float(), router_weight)
     torch.testing.assert_close(output, reference, rtol=1e-5, atol=2e-6)

@@ -116,6 +116,38 @@ def test_aiter_gemma_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
+def test_aiter_gemma_dispatch_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden_states = torch.randn(2, 16)
+    residual = torch.randn_like(hidden_states)
+    norm = GemmaRMSNorm(16, eps=1e-6)
+    reduced = torch.randn_like(hidden_states)
+
+    monkeypatch.setattr(
+        fused_module,
+        "get_tensor_model_parallel_world_size",
+        lambda: 8,
+    )
+    monkeypatch.setattr(fused_module, "_can_use_aiter", lambda *_args: True)
+    monkeypatch.setattr(fused_module, "_can_use_flashinfer", lambda *_args: (False, 0))
+    monkeypatch.setattr(
+        fused_module,
+        "tensor_model_parallel_all_reduce",
+        lambda _hidden_states: reduced,
+    )
+
+    output = fused_allreduce_gemma_rms_norm(
+        hidden_states,
+        residual,
+        norm,
+        allow_aiter=False,
+    )
+    expected = norm(reduced, residual)
+
+    torch.testing.assert_close(output, expected)
+
+
 @ensure_current_vllm_config()
 def _worker_fused_ar_norm(
     local_rank,
