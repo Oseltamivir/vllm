@@ -17,6 +17,7 @@ from torch.multiprocessing import spawn
 
 import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as fused_module
 from tests.utils import ensure_current_vllm_config, init_test_distributed_environment
+from vllm import _aiter_ops as aiter_module
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
@@ -26,6 +27,25 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.torch_utils import set_random_seed
+
+
+def test_mi300x_m3_aiter_prefers_two_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx942", lambda: True)
+    communicator = SimpleNamespace(world_size=8, fully_connected=True)
+    hidden_states = torch.empty(1, 6144, dtype=torch.bfloat16)
+
+    assert not aiter_module._aiter_fused_allreduce_use_1stage(
+        hidden_states,
+        communicator,
+        gemma_norm=True,
+    )
+    assert aiter_module._aiter_fused_allreduce_use_1stage(
+        hidden_states,
+        communicator,
+        gemma_norm=False,
+    )
 
 
 def test_aiter_gemma_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -821,17 +821,12 @@ def _rocm_aiter_rmsnorm_fused_dynamic_quant_fake(
     return out, y_scale
 
 
-def _rocm_aiter_fused_allreduce_rmsnorm(
+def _aiter_fused_allreduce_use_1stage(
     input_: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
+    aiter_ar: AiterCustomAllreduceProto,
     *,
     gemma_norm: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
-    assert aiter_ar is not None, "aiter allreduce must be initialized"
-
+) -> bool:
     total_bytes = input_.numel() * input_.element_size()
     hidden_dim = input_.shape[-1]
     token_num = input_.shape[0]
@@ -854,6 +849,33 @@ def _rocm_aiter_fused_allreduce_rmsnorm(
         size_ok = False
 
     use_1stage = hidden_ok and token_ok and size_ok
+    if use_1stage and gemma_norm and world_size == 8 and hidden_dim == 6144:
+        from vllm.platforms.rocm import on_gfx942
+
+        # MiniMax M3 profiling on TP8 MI300X shows the two-stage fused kernel
+        # is faster even for one token, where the generic heuristic picks one
+        # stage (17.65us vs 20.26us).
+        if on_gfx942():
+            return False
+    return use_1stage
+
+
+def _rocm_aiter_fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    *,
+    gemma_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+    assert aiter_ar is not None, "aiter allreduce must be initialized"
+
+    use_1stage = _aiter_fused_allreduce_use_1stage(
+        input_,
+        aiter_ar,
+        gemma_norm=gemma_norm,
+    )
 
     if gemma_norm:
         result = aiter_ar.fused_ar_rms(
