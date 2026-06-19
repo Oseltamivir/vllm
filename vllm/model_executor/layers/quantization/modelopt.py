@@ -1892,7 +1892,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         moe_config: FusedMoEConfig,
     ) -> None:
         super().__init__(moe_config)
-        self.requantize_mxfp8_to_block_fp8 = current_platform.is_fp8_fnuz()
+        self.requantize_mxfp8_to_block_fp8 = (
+            current_platform.is_fp8_fnuz() and self.moe.mxfp8_block_fp8_on_fnuz
+        )
         self.weight_block_size = (
             [128, 128] if self.requantize_mxfp8_to_block_fp8 else [1, MXFP8_BLOCK_SIZE]
         )

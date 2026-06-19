@@ -308,7 +308,27 @@ def test_mxfp8_gfx94x_selects_block_fp8_backend(use_ep):
         device=DEVICE,
         routing_method=RoutingMethodType.TopK,
         max_num_tokens=128,
+        mxfp8_block_fp8_on_fnuz=True,
     )
+
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8Config,
+        ModelOptMxFp8FusedMoE,
+    )
+
+    modelopt_config = ModelOptMxFp8Config(
+        is_checkpoint_mxfp8_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+    method = ModelOptMxFp8FusedMoE(modelopt_config, config)
+    assert method.requantize_mxfp8_to_block_fp8
+
+    default_method = ModelOptMxFp8FusedMoE(
+        modelopt_config,
+        replace(config, mxfp8_block_fp8_on_fnuz=False),
+    )
+    assert not default_method.requantize_mxfp8_to_block_fp8
 
     backend, experts_cls = select_mxfp8_moe_backend(
         config,

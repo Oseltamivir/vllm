@@ -111,6 +111,7 @@ def FusedMoE(
     num_expert_group: int | None = None,
     topk_group: int | None = None,
     quant_config: QuantizationConfig | None = None,
+    mxfp8_block_fp8_on_fnuz: bool = False,
     tp_size: int | None = None,
     dp_size: int | None = None,
     pcp_size: int | None = None,
@@ -170,6 +171,8 @@ def FusedMoE(
         num_expert_group: Number of expert groups for grouped top-k
         topk_group: Top-k value per group for grouped top-k
         quant_config: Quantization configuration
+        mxfp8_block_fp8_on_fnuz: Requantize serialized MXFP8 MoE weights to
+                                 block FP8 on FNUZ devices
         tp_size: Tensor parallelism size (None = use global default)
         dp_size: Data parallelism size (None = use global default)
         pcp_size: Pipeline context parallelism size (None = use global default)
@@ -320,6 +323,7 @@ def FusedMoE(
         max_num_tokens=max_num_batched_tokens,
         has_bias=has_bias,
         is_lora_enabled=vllm_config.lora_config is not None,
+        mxfp8_block_fp8_on_fnuz=mxfp8_block_fp8_on_fnuz,
         activation=moe_activation,
         device=vllm_config.device_config.device,
         routing_method=router.routing_method_type,  # Not ideal

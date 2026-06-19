@@ -327,6 +327,7 @@ class MiniMaxM3MoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
+            mxfp8_block_fp8_on_fnuz=True,
             runner_args={"reduce_results": reduce_results},
             prefix=f"{prefix}.experts",
         )

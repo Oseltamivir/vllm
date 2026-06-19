@@ -1282,6 +1282,7 @@ class FusedMoEConfig:
     max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP
     has_bias: bool = False
     is_lora_enabled: bool = False
+    mxfp8_block_fp8_on_fnuz: bool = False
 
     # SwiGLU clamp limit. When set, backends that do not implement the clamp
     # are filtered out by `FusedMoEExperts.is_supported_config` so the oracle
