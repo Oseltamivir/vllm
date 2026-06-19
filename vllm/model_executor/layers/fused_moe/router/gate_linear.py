@@ -15,8 +15,7 @@ class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
     1. DSV3 specialized kernel (SM90+, fp32 out, M<=16, H=7168, E=256/384)
-    2. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out,
-       M<=32, H=3072, E=256)
+    2. fp32 specialized kernels (SM90+ or gfx942, bf16/fp32 in, fp32 out)
     3. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
     4. F.linear via ReplicatedLinear (ultimate fallback)
 
@@ -33,6 +32,8 @@ class GateLinear(ReplicatedLinear):
     #   (3072, 256) -> MiniMax-M2/M2.5,  (6144, 128) -> MiniMax-M3
     FP32_SUPPORTED_SHAPES = {(3072, 256), (6144, 128)}
     FP32_MAX_TOKENS = 32
+    ROCM_FP32_SUPPORTED_SHAPES = {(6144, 128)}
+    ROCM_FP32_MAX_TOKENS = 16
 
     def __init__(
         self,
@@ -84,6 +85,12 @@ class GateLinear(ReplicatedLinear):
             and (is_hopper or is_blackwell)
             and (input_size, output_size) in self.FP32_SUPPORTED_SHAPES
         )
+        self.allow_rocm_fp32_router_gemm = (
+            not bias
+            and self.weight.dtype == torch.float32
+            and _on_gfx942()
+            and (input_size, output_size) in self.ROCM_FP32_SUPPORTED_SHAPES
+        )
 
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
@@ -121,7 +128,7 @@ class GateLinear(ReplicatedLinear):
             )
             return output, None
 
-        # Tier 2: fp32 specialized kernel (H=3072, E=256, M<=32)
+        # Tier 2a: CUDA fp32 specialized kernel (M<=32)
         # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
         # capture does not freeze the runtime num_tokens branch.
         if self.allow_fp32_router_gemm and x.dtype in (
@@ -129,6 +136,11 @@ class GateLinear(ReplicatedLinear):
             torch.bfloat16,
         ):
             output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight)
+            return output, None
+
+        # Tier 2b: gfx942 M3 fp32 router kernel (BF16 input, M<=16)
+        if self.allow_rocm_fp32_router_gemm and x.dtype == torch.bfloat16:
+            output = torch.ops.vllm.rocm_fp32_router_gemm_dispatch(x, self.weight)
             return output, None
 
         # Tier 3: cuBLAS bf16→fp32
@@ -146,6 +158,15 @@ class GateLinear(ReplicatedLinear):
 
 
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
+_ROCM_FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.ROCM_FP32_MAX_TOKENS
+
+
+def _on_gfx942() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx942
+
+    return on_gfx942()
 
 
 def fp32_router_gemm_dispatch_impl(
@@ -174,3 +195,35 @@ direct_register_custom_op(
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
 )
+
+
+def rocm_fp32_router_gemm_dispatch_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    if (
+        0 < x.shape[0] <= _ROCM_FP32_ROUTER_GEMM_MAX_TOKENS
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.float32
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (
+            rocm_fp32_router_gemm,
+        )
+
+        return rocm_fp32_router_gemm(x, weight)
+    return torch.nn.functional.linear(x.float(), weight)
+
+
+def rocm_fp32_router_gemm_dispatch_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+if current_platform.is_rocm():
+    direct_register_custom_op(
+        op_name="rocm_fp32_router_gemm_dispatch",
+        op_func=rocm_fp32_router_gemm_dispatch_impl,
+        fake_impl=rocm_fp32_router_gemm_dispatch_fake,
+    )
