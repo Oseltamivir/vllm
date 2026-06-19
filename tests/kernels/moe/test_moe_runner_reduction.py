@@ -22,6 +22,7 @@ def _make_runner(
     reduce_results: bool,
     kernel_output_is_reduced: bool = False,
     is_sequence_parallel: bool = False,
+    routed_scaling_factor: float = 1.0,
 ) -> MoERunner:
     runner = object.__new__(MoERunner)
     runner.__dict__["reduce_results"] = reduce_results
@@ -35,6 +36,8 @@ def _make_runner(
             moe_kernel=_Kernel(kernel_output_is_reduced),
         )
     )
+    runner.__dict__["routed_scaling_factor"] = routed_scaling_factor
+    runner.__dict__["routed_output_transform"] = None
     return runner
 
 
@@ -76,3 +79,21 @@ def test_deferred_final_reduction_skips_allreduce(monkeypatch) -> None:
         states + 1,
     )
     assert calls == 1
+
+
+def test_gfx942_fuses_bf16_shared_add_with_scale(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "_use_gfx942_fused_shared_routed_add",
+        lambda: True,
+    )
+    runner = _make_runner(reduce_results=True, routed_scaling_factor=2.0)
+    shared = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
+    routed = torch.tensor([[0.75, 1.5]], dtype=torch.bfloat16)
+    routed_before = routed.clone()
+
+    actual = runner._combine_shared_and_routed_outputs(shared, routed)
+    expected = shared + routed_before * 2.0
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(routed, routed_before, rtol=0, atol=0)
