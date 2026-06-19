@@ -48,6 +48,35 @@ def test_mi300x_m3_aiter_prefers_two_stage(
     )
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "tp_size", "on_gfx942", "expected"),
+    [
+        (1536, 6144, 8, True, True),
+        (2048, 6144, 8, True, False),
+        (8192, 6144, 8, True, False),
+        (8192, 4096, 8, True, True),
+        (8192, 6144, 4, True, True),
+        (8192, 6144, 8, False, True),
+    ],
+)
+def test_aiter_gemma_mi300x_shape_profitability(
+    num_tokens: int,
+    hidden_size: int,
+    tp_size: int,
+    on_gfx942: bool,
+    expected: bool,
+) -> None:
+    assert (
+        fused_module._aiter_gemma_shape_is_profitable(
+            num_tokens,
+            hidden_size,
+            tp_size,
+            on_gfx942=on_gfx942,
+        )
+        is expected
+    )
+
+
 def test_aiter_gemma_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     hidden_states = torch.randn(2, 16)
     residual = torch.randn_like(hidden_states)

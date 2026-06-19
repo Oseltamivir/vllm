@@ -53,6 +53,24 @@ except ImportError:
 
 
 _FI_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
+_MI300X_M3_AITER_MAX_TOKENS = 1536
+
+
+def _aiter_gemma_shape_is_profitable(
+    num_tokens: int,
+    hidden_size: int,
+    tp_size: int,
+    *,
+    on_gfx942: bool,
+) -> bool:
+    # TP8 MiniMax M3 crosses over between 1536 and 2048 tokens on MI300X.
+    # Large chunked-prefill batches are faster with NCCL plus the native norm.
+    return not (
+        on_gfx942
+        and tp_size == 8
+        and hidden_size == 6144
+        and num_tokens > _MI300X_M3_AITER_MAX_TOKENS
+    )
 
 
 def initialize_aiter_fused_allreduce_gemma_rms_norm() -> bool:
@@ -100,8 +118,16 @@ def _can_use_aiter(
         return False
 
     from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms.rocm import on_gfx942
 
     if not rocm_aiter_ops.is_fused_allreduce_gemma_rmsnorm_enabled():
+        return False
+    if not _aiter_gemma_shape_is_profitable(
+        hidden_states.shape[0],
+        hidden_states.shape[1],
+        get_tensor_model_parallel_world_size(),
+        on_gfx942=on_gfx942(),
+    ):
         return False
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     return bool(
