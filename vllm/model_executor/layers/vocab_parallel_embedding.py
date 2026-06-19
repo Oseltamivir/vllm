@@ -232,6 +232,7 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: padding size for the vocabulary.
         quant_config: quant config for the layer
         prefix: full name of the layer in the state dict
+        enable_tp: shard the embedding across the tensor-parallel group.
     """  # noqa: E501
 
     # --8<-- [end:vocab_parallel_embedding]
@@ -245,12 +246,13 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        enable_tp: bool = True,
     ):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank() if enable_tp else 0
+        self.tp_size = get_tensor_model_parallel_world_size() if enable_tp else 1
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -487,9 +489,11 @@ class VocabParallelEmbedding(PluggableLayer):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        return output
+        # Reduce across all model-parallel GPUs only when the embedding is
+        # actually sharded. Replicated embeddings already produce full output.
+        if self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

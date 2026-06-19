@@ -1130,6 +1130,49 @@ def test_vocab_parallel_embedding_indices(tp_size, seed, default_vllm_config):
         assert torch.all(reindexed_token_ids[vocab_size:] == -1)
 
 
+def test_vocab_parallel_embedding_replication(default_vllm_config):
+    vocab_size = 4096
+    embedding_dim = 64
+    with (
+        patch(
+            "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_rank",
+            return_value=7,
+        ),
+        patch(
+            "vllm.model_executor.layers.vocab_parallel_embedding.get_tensor_model_parallel_world_size",
+            return_value=8,
+        ),
+    ):
+        embedding = VocabParallelEmbedding(
+            vocab_size,
+            embedding_dim,
+            enable_tp=False,
+        )
+
+    assert embedding.tp_size == 1
+    assert embedding.shard_indices.org_vocab_start_index == 0
+    assert embedding.shard_indices.org_vocab_end_index == vocab_size
+    assert embedding.weight.shape == (vocab_size, embedding_dim)
+
+    loaded_weight = torch.randn(
+        vocab_size,
+        embedding_dim,
+        dtype=embedding.weight.dtype,
+        device=embedding.weight.device,
+    )
+    embedding.weight.weight_loader(embedding.weight, loaded_weight)
+    torch.testing.assert_close(embedding.weight, loaded_weight)
+
+    input_ids = torch.tensor([0, 7, vocab_size - 1], device=embedding.weight.device)
+    with patch(
+        "vllm.model_executor.layers.vocab_parallel_embedding.tensor_model_parallel_all_reduce",
+        side_effect=AssertionError("replicated embedding must not all-reduce"),
+    ):
+        actual = embedding(input_ids)
+    expected = F.embedding(input_ids, embedding.weight)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_get_masked_input_and_mask():
     x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
 

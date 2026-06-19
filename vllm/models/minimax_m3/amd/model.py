@@ -96,6 +96,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -121,6 +122,26 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _use_mi300x_replicated_input_embedding(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.model_config.hf_text_config
+    parallel_config = vllm_config.parallel_config
+    if not (
+        config.vocab_size == 200064
+        and config.hidden_size == 6144
+        and vllm_config.lora_config is None
+        and parallel_config.tensor_parallel_size == 8
+        and parallel_config.pipeline_parallel_size == 1
+        and not parallel_config.enable_expert_parallel
+    ):
+        return False
+    if not current_platform.is_rocm():
+        return False
+
+    from vllm.platforms.rocm import on_gfx942
+
+    return on_gfx942()
 
 
 def _build_rotary_emb(config: PretrainedConfig, head_dim: int):
@@ -804,6 +825,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             config.hidden_size,
             quant_config=quant_config,
             prefix=f"{prefix}.embed_tokens",
+            enable_tp=not _use_mi300x_replicated_input_embedding(vllm_config),
         )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
