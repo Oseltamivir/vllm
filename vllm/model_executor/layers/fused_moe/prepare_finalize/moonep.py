@@ -46,6 +46,10 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
 logger = init_logger(__name__)
 
+# Profile and warmup runs feed all-padding batches whose routing ids are all
+# -1; only start sampling the invalid fraction once real traffic is flowing.
+_INVALID_CHECK_SKIP_CALLS = 8
+
 
 @triton.jit
 def _moonep_m_indices_kernel(
@@ -172,6 +176,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self._route_weights_nvs: torch.Tensor | None = None
         self._num_tokens: int | None = None
         self._checked_invalid = False
+        self._sanitize_calls = 0
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -291,7 +296,16 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # of the routing weights and yield a plausible but badly wrong output
         # instead of the loud failure that used to occur. Checked once, and
         # never while capturing, since it syncs.
-        if not self._checked_invalid and not torch.cuda.is_current_stream_capturing():
+        # Skip the first few calls: vLLM's profile/dummy runs mark every token
+        # as padding, and K3's EPLB path sets topk_ids to -1 for padding, so a
+        # dummy run legitimately reads as 100% invalid. Sampling that would
+        # make the check fire on exactly the case it cannot diagnose.
+        self._sanitize_calls += 1
+        if (
+            not self._checked_invalid
+            and self._sanitize_calls > _INVALID_CHECK_SKIP_CALLS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             self._checked_invalid = True
             frac = float(invalid.float().mean().item())
             if frac > 0.05:
