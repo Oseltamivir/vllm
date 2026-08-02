@@ -225,8 +225,20 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             f"got {num_tokens}."
         )
         if pad > 0:
+            topk = topk_ids.size(1)
+            # Zero-filled padding ids would give every padding token the same
+            # expert K times over, which is degenerate for the dedup encoding
+            # (one k-slot bitmask per token over distinct destinations) and
+            # dumps the whole pad batch onto expert 0 as a single huge skew
+            # spike. Spread them instead: distinct within a row, and rotating
+            # across the expert space between rows.
+            pad_ids = (
+                torch.arange(pad * topk, device=topk_ids.device, dtype=torch.int32)
+                % num_experts
+            ).view(pad, topk)
             a1 = torch.nn.functional.pad(a1, (0, 0, 0, pad))
-            topk_ids = torch.nn.functional.pad(topk_ids, (0, 0, 0, pad))
+            topk_ids = torch.cat([topk_ids, pad_ids.to(topk_ids.dtype)], dim=0)
+            # Weight 0 keeps the padding rows from affecting any real token.
             topk_weights = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad))
         self._num_tokens = num_tokens
 
