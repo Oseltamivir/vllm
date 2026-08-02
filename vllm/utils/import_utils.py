@@ -472,6 +472,30 @@ def has_deep_ep_v2() -> bool:
     return True
 
 
+def has_moonep() -> bool:
+    """Whether the optional `moonep` package is available.
+
+    MoonEP communicates exclusively over a single NVLink domain (CUDA VMM
+    plus NVSwitch multicast, with handles exchanged as POSIX file
+    descriptors), so it additionally requires multicast support on the
+    current device. Import is cheap; the multicast probe is a driver query.
+    """
+    if not _has_module("moonep"):
+        return False
+    try:
+        from moonep._C import nvl_multicast_supported  # type: ignore[import-not-found]
+
+        if not nvl_multicast_supported():
+            logger.info_once(
+                "moonep is installed but this device does not support CUDA "
+                "multicast (NVSwitch). The moonep backend will not be available."
+            )
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def has_deep_gemm() -> bool:
     """Whether the optional `deep_gemm` package is available.
 

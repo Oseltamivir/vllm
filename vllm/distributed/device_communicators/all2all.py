@@ -18,7 +18,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_two_sided,
 )
 from vllm.utils.func_utils import supports_kw
-from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_mori
+from vllm.utils.import_utils import has_deep_ep, has_deep_ep_v2, has_moonep, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -1084,6 +1084,80 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
 
     def max_sms_used(self) -> int | None:
         return self._num_sms
+
+    def destroy(self):
+        with self.handle_cache._lock:
+            for _, handle in self.handle_cache._cache.items():
+                handle.destroy()
+            self.handle_cache._cache.clear()
+
+
+class MoonEPAll2AllManager(All2AllManagerBase):
+    """
+    All2All communication based on MoonEP.
+
+    MoonEP (https://github.com/MoonshotAI/MoonEP) keeps every EP rank at
+    exactly ``S * K`` dispatched tokens regardless of how skewed the router
+    is, by reassigning the surplus of overloaded expert owners onto
+    underloaded ranks. That makes the per-layer expert-GEMM shapes static and
+    removes the host synchronization conventional MoE needs to learn the real
+    per-expert token counts.
+
+    It communicates over CUDA VMM allocations shared as POSIX file
+    descriptors, plus NVSwitch multicast for the barrier metadata, so it works
+    within a single NVLink domain only -- there is no RDMA path. ``internode``
+    deployments must use a different backend.
+    """
+
+    def __init__(self, cpu_group, tcp_store_group=None, device_group=None):
+        assert has_moonep(), (
+            "MoonEP not available. Requires the `moonep` package "
+            "(https://github.com/MoonshotAI/MoonEP) and a device with CUDA "
+            "multicast (NVSwitch) support."
+        )
+        super().__init__(cpu_group, tcp_store_group)
+        if self.internode:
+            raise ValueError(
+                "The moonep all2all backend spans a single NVLink domain "
+                "only (it shares memory via POSIX file descriptors, which do "
+                "not cross hosts), but this EP group spans multiple nodes. "
+                "Use deepep_high_throughput or deepep_v2 instead."
+            )
+        self._device_group = device_group
+        self.handle_cache = Cache()
+
+    def _make_all2all_kwargs(
+        self,
+        max_num_tokens_per_rank: int,
+        token_hidden_size: int,
+        num_topk: int,
+        num_global_experts: int,
+        token_padding: int,
+        num_prefetch_slots: int,
+    ) -> dict:
+        return dict(
+            S=max_num_tokens_per_rank,
+            H=token_hidden_size,
+            K=num_topk,
+            E=num_global_experts,
+            num_ep_ranks=self.world_size,
+            token_padding=token_padding,
+            B=num_prefetch_slots,
+            group=self._device_group
+            if self._device_group is not None
+            else self.cpu_group,
+            # Buffer.destroy() must run before the process group is torn down;
+            # warn instead of doing it from __del__ at interpreter shutdown.
+            explicitly_destroy=True,
+        )
+
+    def get_handle(self, kwargs):
+        from moonep import Buffer  # type: ignore[import-not-found]
+
+        buffer_kwargs = self._make_all2all_kwargs(**kwargs)
+        logger.debug("MoonEP all2all args %s", buffer_kwargs)
+        handle: Buffer = self.handle_cache.get_or_create(buffer_kwargs, Buffer)
+        return handle
 
     def destroy(self):
         with self.handle_cache._lock:
