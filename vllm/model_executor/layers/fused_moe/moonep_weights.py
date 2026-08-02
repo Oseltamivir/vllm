@@ -31,15 +31,9 @@ import torch
 import torch.distributed as dist
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    deepgemm_post_process_weight_scale_block,
-)
 from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
-
-# MXFP4 scale group along the reduction dim.
-MXFP4_GROUP = 32
 
 # Experts per rank are padded up to a multiple of this. With a 2 MiB VMM
 # granularity, 128 rows align any tensor whose per-expert size is a multiple
@@ -192,14 +186,22 @@ class MoonEPExpertWeights:
         # (E_pad_global, mn, k) with the tight group stride k*mn DeepGEMM wants.
         return buf.permute(0, 2, 1)
 
-    def publish(
+    def publish_converted(
         self,
-        layer,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
         num_local_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Bind the full mappings and symmetric scales onto ``layer``.
+        """Globalize the weights after vLLM's own backend conversion.
+
+        Called with the scales that ``convert_weight_to_mxfp4_moe_kernel_format``
+        already transformed into DeepGEMM's packed UE8M0 layout for this rank's
+        shard -- that transform is per-expert independent, so publishing its
+        output symmetrically keeps every expert addressable by row.
+
+        The FP4 payloads were allocated symmetrically up front and the
+        conversion passes them through untouched, so they only need swapping
+        from this rank's slice back to the global mapping.
 
         Returns ``(w13, w2, w13_scale, w2_scale)`` in the global expert space.
         """
@@ -209,28 +211,10 @@ class MoonEPExpertWeights:
         if dist.is_initialized():
             dist.barrier(group=self.ep_device_group)
 
-        w13_local = deepgemm_post_process_weight_scale_block(
-            ws=layer.w13_weight_scale.data,
-            mn=2 * intermediate_size,
-            k=hidden_size,
-            quant_block_shape=(1, MXFP4_GROUP),
-            num_groups=num_local_experts,
-        )
-        w2_local = deepgemm_post_process_weight_scale_block(
-            ws=layer.w2_weight_scale.data,
-            mn=hidden_size,
-            k=intermediate_size,
-            quant_block_shape=(1, MXFP4_GROUP),
-            num_groups=num_local_experts,
-        )
-        w13_scale = self._symmetrize_scales(w13_local, num_local_experts)
-        w2_scale = self._symmetrize_scales(w2_local, num_local_experts)
+        w13_scale_full = self._symmetrize_scales(w13_scale, num_local_experts)
+        w2_scale_full = self._symmetrize_scales(w2_scale, num_local_experts)
 
         if dist.is_initialized():
             dist.barrier(group=self.ep_device_group)
 
-        layer.w13_weight = torch.nn.Parameter(self.w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(self.w2, requires_grad=False)
-        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
-        return self.w13, self.w2, w13_scale, w2_scale
+        return self.w13, self.w2, w13_scale_full, w2_scale_full
