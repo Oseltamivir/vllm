@@ -33,6 +33,7 @@ from vllm.platforms import current_platform
 from vllm.utils.import_utils import (
     has_deep_ep,
     has_deep_ep_v2,
+    has_moonep,
     has_mori,
     has_nixl_ep,
 )
@@ -48,6 +49,8 @@ if current_platform.is_cuda_alike():
         )
     if has_deep_ep_v2():
         from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
+    if has_moonep():
+        from .prepare_finalize.moonep import MoonEPPrepareAndFinalize
     if has_mori():
         from .prepare_finalize.mori import MoriPrepareAndFinalize
     if has_nixl_ep():
@@ -244,6 +247,46 @@ def maybe_make_prepare_finalize(
             num_topk=moe.experts_per_token,
             use_fp8_dispatch=use_fp8_dispatch,
             use_cudagraph=use_cudagraph,
+        )
+
+    elif moe.use_moonep_kernels:
+        assert moe.dp_size == all2all_manager.dp_world_size
+
+        # MoonEP is bf16 on the wire; activations are quantized after
+        # dispatch by the prepare/finalize receiver.
+        #
+        # token_padding is the multiple every per-expert segment is padded up
+        # to, which fixes the alignment of every segment start. DeepGEMM's
+        # contiguous grouped GEMM reads m_indices once per BLOCK_M rows, so
+        # segment starts must be BLOCK_M aligned; matching the two keeps that
+        # invariant without capping DeepGEMM's tile heuristic.
+        from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+
+        token_padding = get_mk_alignment_for_contiguous_layout()[0]
+
+        # One prefetch slot is the minimum MoonEP allows. We never call
+        # prefetch_weight: the experts kernel resolves slot segments back to
+        # their global expert id via plan.experts_to_copy and reads that
+        # expert's row out of the symmetric weight mapping instead.
+        all_to_all_args = dict(
+            max_num_tokens_per_rank=moe.max_num_tokens,
+            token_hidden_size=moe.hidden_dim,
+            num_topk=moe.experts_per_token,
+            num_global_experts=moe.num_experts,
+            token_padding=token_padding,
+            num_prefetch_slots=1,
+        )
+        handle = all2all_manager.get_handle(all_to_all_args)
+
+        prepare_finalize = MoonEPPrepareAndFinalize(
+            buffer=handle,
+            num_dispatchers=all2all_manager.world_size,
+            dp_size=all2all_manager.dp_world_size,
+            rank=all2all_manager.rank,
+            num_experts=moe.num_experts,
+            num_topk=moe.experts_per_token,
+            max_num_tokens=moe.max_num_tokens,
+            token_padding=token_padding,
         )
 
     elif moe.use_mori_kernels:
