@@ -19,7 +19,7 @@ Two layout constraints drive the code below:
   DeepGEMM-transformed scales are not, and DeepGEMM rejects a padded scale
   group stride outright (``sf.stride(-3) == sf.stride(-1) * sf.size(-1)``).
   So the *expert* extent absorbs the alignment: each rank reserves
-  ``moonep_expert_row_pad(E/R)`` rows of which the first ``E/R`` are real.
+  ``expert_row_pad(E/R)`` rows of which the first ``E/R`` are real.
   Rows stay tightly packed, and the prepare step emits buffer rows rather
   than bare expert ids so the padding is invisible to the GEMM.
 * DeepGEMM's scale transform is per-expert independent (verified on B300:
@@ -39,13 +39,16 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.experts.moonep_deep_gemm_moe import (
     MoonEPDeepGemmFP4Experts,
 )
+from vllm.model_executor.layers.fused_moe.moonep_weights import (
+    alloc_symmetric,
+    alloc_symmetric_uint8,
+    expert_row_pad,
+    vmm_granularity,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
-)
-from vllm.model_executor.layers.fused_moe.prepare_finalize.moonep import (
-    moonep_expert_row_pad,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4MoEMethod,
@@ -59,65 +62,6 @@ logger = init_logger(__name__)
 
 # MXFP4 scale group along the reduction dim.
 _MXFP4_GROUP = 32
-
-
-def _vmm_granularity() -> int:
-    from moonep._C import get_vmm_granularity  # type: ignore[import-not-found]
-
-    return get_vmm_granularity()
-
-
-def _alloc_symmetric(
-    chunk_shape: list[int],
-    dtype: torch.dtype,
-    rank: int,
-    world_size: int,
-    group,
-) -> torch.Tensor:
-    """Map one ``chunk_shape`` per rank into a single ``[R*chunk0, ...]`` VA.
-
-    ``create_nvl_dist_tensor`` requires the chunk to be granularity aligned
-    and silently pads dim 0 otherwise, which would break the "row == global
-    expert id" invariant every caller here depends on, so assert instead.
-    """
-    from moonep.buffer import (  # type: ignore[import-not-found]
-        create_nvl_dist_tensor,
-    )
-
-    nbytes = 1
-    for d in chunk_shape:
-        nbytes *= d
-    nbytes *= dtype.itemsize
-    gran = _vmm_granularity()
-    assert nbytes % gran == 0, (
-        f"MoonEP symmetric chunk {chunk_shape} of {dtype} is {nbytes} bytes, "
-        f"not a multiple of the {gran}-byte VMM granularity; dim 0 would be "
-        f"padded and global expert indexing would break."
-    )
-
-    full = create_nvl_dist_tensor(
-        list(chunk_shape), dtype, rank, world_size, group=group
-    )
-    assert full.shape[0] == world_size * chunk_shape[0]
-    return full
-
-
-def _alloc_symmetric_uint8(
-    chunk_shape: list[int], rank: int, world_size: int, group
-) -> torch.Tensor:
-    """Allocate a uint8 symmetric tensor.
-
-    MoonEP's allocator sizes chunks from a small dtype table that does not
-    include uint8, so allocate int32 with a quarter-width last dim and
-    reinterpret. The byte layout and alignment are identical, and this keeps
-    the PR free of any MoonEP-side change.
-    """
-    assert chunk_shape[-1] % 4 == 0, (
-        f"last dim {chunk_shape[-1]} must be divisible by 4 to alias int32"
-    )
-    i32_shape = list(chunk_shape[:-1]) + [chunk_shape[-1] // 4]
-    full_i32 = _alloc_symmetric(i32_shape, torch.int32, rank, world_size, group)
-    return full_i32.view(torch.uint8)
 
 
 class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
@@ -149,7 +93,7 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
 
     def _own_slice(self, full: torch.Tensor, num_local_experts: int) -> torch.Tensor:
         """This rank's real experts inside its padded row block."""
-        lo = self.ep_rank * moonep_expert_row_pad(num_local_experts)
+        lo = self.ep_rank * expert_row_pad(num_local_experts)
         return full[lo : lo + num_local_experts]
 
     def create_weights(
@@ -168,13 +112,13 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         rank, world, group = self.ep_rank, self.ep_size, self.ep_device_group
         n13 = 2 * intermediate_size_per_partition
         # Rows reserved per rank; only the first `num_experts` are real.
-        e_pad = moonep_expert_row_pad(num_experts)
+        e_pad = expert_row_pad(num_experts)
 
         # FP4 payloads: two values per byte along the reduction dim.
-        w13_full = _alloc_symmetric_uint8(
+        w13_full = alloc_symmetric_uint8(
             [e_pad, n13, hidden_size // 2], rank, world, group
         )
-        w2_full = _alloc_symmetric_uint8(
+        w2_full = alloc_symmetric_uint8(
             [e_pad, hidden_size, intermediate_size_per_partition // 2],
             rank,
             world,
@@ -255,15 +199,15 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         )
         assert e_local == num_local_experts
 
-        e_pad = moonep_expert_row_pad(e_local)
-        gran = _vmm_granularity()
+        e_pad = expert_row_pad(e_local)
+        gran = vmm_granularity()
         per_expert = k * mn * local_transformed.element_size()
         assert (e_pad * per_expert) % gran == 0, (
             f"scale chunk {e_pad}x{per_expert} bytes is not a multiple of the "
             f"{gran}-byte VMM granularity"
         )
 
-        buf = _alloc_symmetric(
+        buf = alloc_symmetric(
             [e_pad, k, mn],
             torch.int32,
             self.ep_rank,

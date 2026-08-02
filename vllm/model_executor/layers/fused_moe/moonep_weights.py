@@ -52,7 +52,7 @@ def vmm_granularity() -> int:
     return get_vmm_granularity()
 
 
-def _alloc_symmetric(
+def alloc_symmetric(
     chunk_shape: list[int],
     dtype: torch.dtype,
     rank: int,
@@ -100,7 +100,7 @@ def alloc_symmetric_uint8(
         f"last dim {chunk_shape[-1]} must be divisible by 4 to alias int32"
     )
     i32_shape = list(chunk_shape[:-1]) + [chunk_shape[-1] // 4]
-    return _alloc_symmetric(i32_shape, torch.int32, rank, world_size, group).view(
+    return alloc_symmetric(i32_shape, torch.int32, rank, world_size, group).view(
         torch.uint8
     )
 
@@ -186,7 +186,7 @@ class MoonEPExpertWeights:
             f"{gran}-byte VMM granularity"
         )
 
-        buf = _alloc_symmetric(
+        buf = alloc_symmetric(
             [e_pad, k, mn],
             torch.int32,
             self.ep_rank,
