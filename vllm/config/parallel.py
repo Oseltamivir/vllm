@@ -678,6 +678,11 @@ class ParallelConfig:
             self.all2all_backend == "moonep"
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
+            # Match the model-side condition: at PP>1 the model does not
+            # sequence-shard, so claiming SP here would have every TP rank
+            # dispatch the same tokens against a scatter/gather that never
+            # happened.
+            and self.pipeline_parallel_size == 1
         ):
             # MoonEP dispatches a distinct slice of the sequence from every
             # rank, so the MoE input has to be sequence parallel across TP.

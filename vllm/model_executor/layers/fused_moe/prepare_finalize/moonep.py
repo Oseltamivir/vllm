@@ -161,6 +161,13 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # dispatch returns a plan that combine needs back, plus the routing
         # weights in dispatched order. MoonEP's combine does not apply them.
+        #
+        # This is single-microbatch state, and deliberately so: MoonEP's
+        # Buffer has one comm shard and one barrier set, so two concurrent
+        # dispatches would corrupt each other regardless of what Python held.
+        # vLLM's ubatching allowlist (config/vllm.py) does not include moonep,
+        # so DBO cannot reach here; adding it would need per-ubatch buffers,
+        # not just per-ubatch plan state.
         self._plan = None
         self._route_weights_nvs: torch.Tensor | None = None
         self._num_tokens: int | None = None

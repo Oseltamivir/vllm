@@ -37,6 +37,7 @@ from vllm.utils.import_utils import (
     has_mori,
     has_nixl_ep,
 )
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -268,8 +269,15 @@ def maybe_make_prepare_finalize(
         # prefetch_weight: the experts kernel resolves slot segments back to
         # their global expert id via plan.experts_to_copy and reads that
         # expert's row out of the symmetric weight mapping instead.
+        # MoonEP holds exactly S tokens per rank and every dispatch pads to
+        # S, so an oversized S makes each step cost a full max-batch dispatch.
+        # This backend forces sequence-parallel MoE, so a rank never sees more
+        # than ceil(max_num_tokens / sp_size).
+        sp_size = max(1, moe.moe_parallel_config.sp_size)
+        tokens_per_rank = cdiv(moe.max_num_tokens, sp_size)
+
         all_to_all_args = dict(
-            max_num_tokens_per_rank=moe.max_num_tokens,
+            max_num_tokens_per_rank=tokens_per_rank,
             token_hidden_size=moe.hidden_dim,
             num_topk=moe.experts_per_token,
             num_global_experts=moe.num_experts,
@@ -286,7 +294,7 @@ def maybe_make_prepare_finalize(
             num_experts=moe.num_experts,
             num_local_experts=moe.num_local_experts,
             num_topk=moe.experts_per_token,
-            max_num_tokens=moe.max_num_tokens,
+            max_num_tokens=tokens_per_rank,
             token_padding=token_padding,
         )
 
