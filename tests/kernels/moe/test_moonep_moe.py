@@ -93,20 +93,27 @@ def test_m_indices_empty_slot_is_skipped():
 
 
 @requires_moonep
-def test_local_tokens_per_expert_handles_invalid_ids():
+def test_local_tokens_per_expert_conserves_total():
+    """The histogram must sum to exactly S*K.
+
+    MoonEP's planner migrates surplus against a CAP of S*K and terminates on
+    that conservation invariant, so an entry dropped here would leave tokens
+    unallocated. Ids are required to be pre-sanitized into [0, num_experts).
+    """
     device = "cuda"
     num_experts = 16
     topk_ids = torch.tensor(
-        [[0, 3, -1], [3, 3, 15], [-1, -1, 0]], dtype=torch.int32, device=device
+        [[0, 3, 15], [3, 3, 0], [7, 7, 7]], dtype=torch.int32, device=device
     )
     got = _local_tokens_per_expert(topk_ids, num_experts)
+
     want = torch.zeros(num_experts, dtype=torch.int32)
     want[0] = 2
     want[3] = 3
+    want[7] = 3
     want[15] = 1
     torch.testing.assert_close(got.cpu(), want)
-    # Invalid ids must not inflate any real bucket.
-    assert int(got.sum().item()) == 6
+    assert int(got.sum().item()) == topk_ids.numel()
 
 
 @requires_moonep
