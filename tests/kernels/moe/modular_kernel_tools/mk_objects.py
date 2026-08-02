@@ -43,6 +43,7 @@ from vllm.utils.import_utils import (
     has_deep_ep,
     has_deep_ep_v2,
     has_deep_gemm,
+    has_moonep,
     has_mori,
 )
 
@@ -229,6 +230,22 @@ if has_deep_ep_v2() and current_platform.has_device_capability(100):
         common_float_types,
         blocked_quantization_support=True,
         backend="deepep_v2",
+    )
+
+if has_moonep() and current_platform.has_device_capability(100):
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.moonep import (
+        MoonEPPrepareAndFinalize,
+    )
+
+    # MoonEP always dispatches bf16 and quantizes afterwards, so it carries no
+    # blocked-quantization dispatch path of its own.
+    register_prepare_and_finalize(
+        MoonEPPrepareAndFinalize,
+        standard_format,
+        common_float_types,
+        blocked_quantization_support=False,
+        backend="moonep",
+        force_multigpu=True,
     )
 
 if has_mori():

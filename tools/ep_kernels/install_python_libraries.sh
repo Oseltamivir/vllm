@@ -5,10 +5,13 @@ set -ex
 #   --workspace <dir>    workspace directory (default: ./ep_kernels_workspace)
 #   --mode <mode>        "install" (default) or "wheel"
 #   --deepep-ref <commit> DeepEP commit hash
-#   --nvshmem-ver <ver>  NVSHMEM version 
+#   --nvshmem-ver <ver>  NVSHMEM version
+#   INSTALL_MOONEP=1     also build MoonEP (single-NVLink-domain EP backend)
 
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 DEEPEP_COMMIT_HASH=${DEEPEP_COMMIT_HASH:-"d4f41e4e93"}
+
+MOONEP_COMMIT_HASH=${MOONEP_COMMIT_HASH:-"main"}
 
 NVSHMEM_VER=${NVSHMEM_VER:-"3.3.24"}  # Default supports both CUDA 12 and 13
 WORKSPACE=${WORKSPACE:-$(pwd)/ep_kernels_workspace}
@@ -233,4 +236,18 @@ do_build \
 if [ "$MODE" = "wheel" ]; then
     echo "All wheels written to $WHEEL_DIR"
     ls -l "$WHEEL_DIR"
+fi
+
+# build MoonEP (optional: the `moonep` all2all backend)
+# MoonEP communicates over CUDA VMM plus NVSwitch multicast within a single
+# NVLink domain, so it needs no NVSHMEM and no RDMA stack. Its kernels are
+# CUTLASS Python DSL, JIT-compiled at runtime; only the small VMM allocator
+# extension is built here.
+if [ "${INSTALL_MOONEP:-0}" = "1" ]; then
+    do_build \
+        "https://github.com/MoonshotAI/MoonEP" \
+        "MoonEP" \
+        "setup.py" \
+        "$MOONEP_COMMIT_HASH" \
+        ""
 fi

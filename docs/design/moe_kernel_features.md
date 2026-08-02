@@ -35,6 +35,7 @@ th {
 | naive | standard | all<sup>1</sup> | G,A,T | N | <sup>6</sup> | [layer.py][vllm.model_executor.layers.fused_moe.runner.MoERunner] |
 | deepep_high_throughput | standard | fp8 | G(128),A,T<sup>2</sup> | Y | Y | [`DeepEPHTPrepareAndFinalize`][vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ht.DeepEPHTPrepareAndFinalize] |
 | deepep_low_latency | batched | fp8 | G(128),A,T<sup>3</sup> | Y | Y | [`DeepEPLLPrepareAndFinalize`][vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll.DeepEPLLPrepareAndFinalize] |
+| moonep | standard | fp8 | G(128)<sup>7</sup> | Y | Y | [`MoonEPPrepareAndFinalize`][vllm.model_executor.layers.fused_moe.prepare_finalize.moonep.MoonEPPrepareAndFinalize] |
 | flashinfer_nvlink_two_sided | standard | nvfp4,fp8 | G,A,T | N | N | [`FlashInferNVLinkTwoSidedPrepareAndFinalize`][vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_two_sided.FlashInferNVLinkTwoSidedPrepareAndFinalize] |
 | flashinfer_nvlink_one_sided | standard | nvfp4,bf16,mxfp8 | G,A,T | N | N | [`FlashInferNVLinkOneSidedPrepareAndFinalize`][vllm.model_executor.layers.fused_moe.prepare_finalize.flashinfer_nvlink_one_sided.FlashInferNVLinkOneSidedPrepareAndFinalize] |
 
@@ -45,6 +46,10 @@ th {
     4. Controlled by `--moe-backend` (`flashinfer_cutlass` or `flashinfer_trtllm`)
     5. This is a no-op dispatcher that can be used to pair with any modular experts to produce a modular kernel that runs without dispatch or combine. These cannot be selected via environment variable. These are generally use for testing or adapting an expert subclass to the `fused_experts` API.
     6. This depends on the experts implementation.
+    7. MoonEP always dispatches in bf16; activation quantization happens after
+       dispatch. It communicates over CUDA VMM plus NVSwitch multicast, so it
+       requires a single NVLink domain (no multi-node EP), and it pairs with
+       MXFP4 expert weights held in symmetric memory.
 
     ---
 

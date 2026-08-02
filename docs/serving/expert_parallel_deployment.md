@@ -26,6 +26,7 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `allgather_reducescatter` | Default backend | Standard all2all using allgather/reducescatter primitives | General purpose, works with any EP+DP configuration |
 | `deepep_high_throughput` | Multi-node prefill | Grouped GEMM with continuous layout, optimized for prefill | Prefill-dominated workloads, high-throughput scenarios |
 | `deepep_low_latency` | Multi-node decode | CUDA graph support, masked layout, optimized for decode | Decode-dominated workloads, low-latency scenarios |
+| `moonep` | Single-node, skewed routing | Perfectly balanced dispatch via dynamic redundant experts; static per-layer GEMM shapes and no per-layer host sync | Fine-grained MoE where router imbalance limits throughput |
 | `flashinfer_nvlink_one_sided` | MNNVL systems | FlashInfer's one-sided A2A strategy for multi-node NVLink | High-throughput workloads |
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
 
