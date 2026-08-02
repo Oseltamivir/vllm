@@ -60,6 +60,16 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         format = scheme_dict.get("format")
 
         if quant_config._is_mxfp4(weight_quant):
+            if layer.moe_config.use_moonep_kernels:
+                # MoonEP computes experts it does not own, so its expert
+                # weights live in a cross-rank symmetric mapping rather than
+                # in per-rank tensors.
+                from .compressed_tensors_moe_moonep_mxfp4 import (
+                    MoonEPCompressedTensorsMxfp4MoEMethod,
+                )
+
+                return MoonEPCompressedTensorsMxfp4MoEMethod(layer.moe_config)
+
             from .compressed_tensors_moe_w4a4_mxfp4 import (
                 CompressedTensorsW4A4Mxfp4MoEMethod,
             )
