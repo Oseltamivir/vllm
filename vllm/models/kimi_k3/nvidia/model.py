@@ -724,11 +724,16 @@ class KimiDecoderLayer(nn.Module):
         )
 
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        # MoonEP, like MegaMoE, is a single-node EP scheme that dispatches a
+        # distinct slice of the sequence from every rank, so it needs the MoE
+        # input sequence parallel even at DP=1. Without it TP replicates the
+        # input and every rank would dispatch the same tokens.
+        use_moonep = parallel_config.all2all_backend == "moonep"
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and (use_mega_moe or use_moonep or parallel_config.data_parallel_size > 1)
         )
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
@@ -967,11 +972,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        # MoonEP, like MegaMoE, is a single-node EP scheme that dispatches a
+        # distinct slice of the sequence from every rank, so it needs the MoE
+        # input sequence parallel even at DP=1. Without it TP replicates the
+        # input and every rank would dispatch the same tokens.
+        use_moonep = parallel_config.all2all_backend == "moonep"
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
             and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+            and (use_mega_moe or use_moonep or parallel_config.data_parallel_size > 1)
         )
 
         self.vocab_size = config.vocab_size
