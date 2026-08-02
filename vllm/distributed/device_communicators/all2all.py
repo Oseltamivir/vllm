@@ -1162,5 +1162,19 @@ class MoonEPAll2AllManager(All2AllManagerBase):
     def destroy(self):
         with self.handle_cache._lock:
             for _, handle in self.handle_cache._cache.items():
-                handle.destroy()
+                try:
+                    handle.destroy()
+                except Exception:  # noqa: BLE001
+                    # Buffer.destroy() synchronizes and frees VMM/NVLink
+                    # resources through the EP process group. vLLM can tear
+                    # that group down first during shutdown, in which case
+                    # MoonEP raises out of destroy() and floods the log with
+                    # tracebacks on every rank. The process is exiting and the
+                    # driver reclaims the mappings, so log and continue.
+                    logger.warning_once(
+                        "MoonEP Buffer.destroy() failed during shutdown; "
+                        "the process group was most likely torn down first. "
+                        "Resources are reclaimed on process exit.",
+                        exc_info=True,
+                    )
             self.handle_cache._cache.clear()
