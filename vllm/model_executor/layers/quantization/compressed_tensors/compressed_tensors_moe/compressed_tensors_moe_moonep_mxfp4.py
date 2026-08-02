@@ -242,6 +242,17 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         """
         e_local, mn, k = local_transformed.shape
         assert local_transformed.dtype == torch.int32
+        # The permute round trip below assumes the backend transform returned
+        # MN-major, tightly packed scales, i.e. per expert the memory is
+        # [k, mn] contiguous. If it were K-major, or MN-major with a
+        # TMA-padded mn stride, the round trip would silently transpose or
+        # drop the padding -- and DeepGEMM's own
+        # stride(-3) == stride(-1)*size(-1) check passes either way, so it
+        # would not catch it. Assert the premise instead.
+        assert local_transformed.stride() == (mn * k, 1, mn), (
+            f"expected MN-major tight scales with stride {(mn * k, 1, mn)}, "
+            f"got {local_transformed.stride()} for shape {(e_local, mn, k)}."
+        )
         assert e_local == num_local_experts
 
         e_pad = moonep_expert_row_pad(e_local)
