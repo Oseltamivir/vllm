@@ -242,6 +242,26 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             topk_weights = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad))
         self._num_tokens = num_tokens
 
+        # vLLM marks invalid routing slots with -1 (padded tokens, and any
+        # slot EPLB or the router leaves unassigned). MoonEP indexes its
+        # planning arrays directly by expert id, so a negative id is an
+        # out-of-bounds device access -- verified on B300: a dispatch with
+        # any -1 present dies with cudaErrorIllegalAddress. Replace them with
+        # real ids spread across the expert space and zero the matching
+        # weight, so the slot is inert but addressable.
+        invalid = (topk_ids < 0) | (topk_ids >= num_experts)
+        if bool(invalid.any()):
+            filler = (
+                torch.arange(
+                    topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype
+                )
+                % num_experts
+            ).view_as(topk_ids)
+            topk_ids = torch.where(invalid, filler, topk_ids)
+            topk_weights = torch.where(
+                invalid, torch.zeros_like(topk_weights), topk_weights
+            )
+
         tokens_per_expert = _local_tokens_per_expert(topk_ids, num_experts)
 
         # MoonEP always moves bf16; activations are quantized after dispatch.

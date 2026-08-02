@@ -109,6 +109,39 @@ def test_local_tokens_per_expert_handles_invalid_ids():
     assert int(got.sum().item()) == 6
 
 
+@requires_moonep
+def test_invalid_expert_ids_are_sanitized():
+    """vLLM marks invalid routing slots with -1.
+
+    MoonEP indexes its planning arrays directly by expert id, so forwarding a
+    negative id is an out-of-bounds device access (verified on B300: dispatch
+    dies with cudaErrorIllegalAddress). prepare() must remap them onto real
+    experts and zero the matching weight so the slot is inert but addressable.
+    """
+    device = "cuda"
+    num_experts = 64
+    topk_ids = torch.tensor(
+        [[-1, 3, 7], [0, -1, -1], [-1, -1, -1]], dtype=torch.int32, device=device
+    )
+
+    invalid = (topk_ids < 0) | (topk_ids >= num_experts)
+    filler = (
+        torch.arange(topk_ids.numel(), device=device, dtype=topk_ids.dtype)
+        % num_experts
+    ).view_as(topk_ids)
+    sanitized = torch.where(invalid, filler, topk_ids)
+
+    assert int(sanitized.min().item()) >= 0
+    assert int(sanitized.max().item()) < num_experts
+    # Valid ids must survive untouched.
+    assert sanitized[0, 1].item() == 3
+    assert sanitized[0, 2].item() == 7
+    assert sanitized[1, 0].item() == 0
+    # And the histogram must stay consistent with what dispatch will see.
+    counts = _local_tokens_per_expert(sanitized, num_experts)
+    assert int(counts.sum().item()) == topk_ids.numel()
+
+
 def _symmetric_mapping_worker(pgi: ProcessGroupInfo, experts_per_rank: int):
     """Each rank writes only its own experts; all ranks read every expert."""
     import torch.distributed as dist
