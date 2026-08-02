@@ -162,6 +162,16 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         # MoonEP computes experts it does not own, so its expert weights live
         # in a cross-rank symmetric mapping rather than per-rank tensors.
         self._moonep_weights: MoonEPExpertWeights | None = None
+        logger.info_once(
+            "Mxfp4MoEMethod init: use_moonep_kernels=%s backend=%s use_ep=%s "
+            "dp=%d sp=%d ep=%d",
+            moe.use_moonep_kernels,
+            moe.moe_parallel_config.all2all_backend,
+            moe.moe_parallel_config.use_ep,
+            moe.moe_parallel_config.dp_size,
+            moe.moe_parallel_config.sp_size,
+            moe.moe_parallel_config.ep_size,
+        )
         if moe.use_moonep_kernels:
             from vllm.distributed import get_ep_group
 
