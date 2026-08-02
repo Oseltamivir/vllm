@@ -35,24 +35,13 @@ import triton.language as tl
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.moonep_weights import (
+    expert_row_pad as moonep_expert_row_pad,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.utils.math_utils import round_up
-
-# Experts per rank are padded up to a multiple of this in the symmetric weight
-# buffers. DeepGEMM requires tightly packed scale groups
-# (``sf.stride(-3) == sf.stride(-1) * sf.size(-1)``), so the expert extent is
-# what absorbs VMM-granularity alignment rather than the K extent. With a
-# 2 MiB granularity, 128 rows align any tensor whose per-expert size is a
-# multiple of 16 KiB.
-MOONEP_EXPERT_ROW_PAD = 128
-
-
-def moonep_expert_row_pad(num_local_experts: int) -> int:
-    """Rows reserved per rank in the symmetric expert buffers."""
-    return round_up(num_local_experts, MOONEP_EXPERT_ROW_PAD)
 
 
 @triton.jit

@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.moonep_weights import (
+    MoonEPExpertWeights,
+)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
@@ -156,6 +159,19 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         self._cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         self.moe_kernel: mk.FusedMoEKernel | None = None
 
+        # MoonEP computes experts it does not own, so its expert weights live
+        # in a cross-rank symmetric mapping rather than per-rank tensors.
+        self._moonep_weights: MoonEPExpertWeights | None = None
+        if moe.use_moonep_kernels:
+            from vllm.distributed import get_ep_group
+
+            ep = get_ep_group()
+            self._moonep_weights = MoonEPExpertWeights(
+                ep_rank=ep.rank_in_group,
+                ep_size=ep.world_size,
+                ep_device_group=ep.device_group,
+            )
+
         # Used for triton kernel precision configs
         self.w13_precision_config = None
         self.w2_precision_config = None
@@ -210,9 +226,19 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
 
+        moonep_w13 = moonep_w2 = None
+        if self._moonep_weights is not None:
+            moonep_w13, moonep_w2 = self._moonep_weights.create_payloads(
+                num_local_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size_per_partition,
+            )
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
-            torch.zeros(
+            moonep_w13
+            if moonep_w13 is not None
+            else torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
@@ -238,7 +264,9 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
-            torch.zeros(
+            moonep_w2
+            if moonep_w2 is not None
+            else torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
@@ -398,6 +426,17 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
+
+        if self._moonep_weights is not None:
+            # Swap the per-rank views for the global symmetric mappings, and
+            # publish the DeepGEMM-transformed scales symmetrically too, so a
+            # segment served by another rank's expert is addressable by row.
+            w13, w2, w13_scale, w2_scale = self._moonep_weights.publish(
+                layer,
+                num_local_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+            )
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
 

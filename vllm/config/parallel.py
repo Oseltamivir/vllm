@@ -674,6 +674,17 @@ class ParallelConfig:
     #
     @property
     def use_sequence_parallel_moe(self) -> bool:
+        if (
+            self.all2all_backend == "moonep"
+            and self.enable_expert_parallel
+            and self.tensor_parallel_size > 1
+        ):
+            # MoonEP dispatches a distinct slice of the sequence from every
+            # rank, so the MoE input has to be sequence parallel across TP.
+            # Unlike the backends below that is worth doing at DP=1 too: it is
+            # what makes TP=8/EP=8 on one node a real all2all deployment
+            # rather than 8x duplicated expert compute.
+            return True
         return (
             self.all2all_backend
             in (
