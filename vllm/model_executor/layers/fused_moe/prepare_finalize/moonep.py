@@ -198,9 +198,15 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        assert expert_map is None, (
-            "MoonEP addresses experts in the global expert space through its "
-            "symmetric weight mapping and does not use an expert_map."
+        # vLLM builds a global->local expert map for EP. MoonEP does not use
+        # it: dispatch takes global expert ids and the weight mapping spans
+        # the global space, so prepare() and the experts kernel both address
+        # experts globally. Check it is the full-space map we expect rather
+        # than silently ignoring something that would mean topk_ids have
+        # already been remapped into local space.
+        assert expert_map is None or expert_map.numel() == num_experts, (
+            f"MoonEP expects global expert ids, but expert_map covers "
+            f"{expert_map.numel()} of {num_experts} experts."
         )
         assert a1.dtype == torch.bfloat16, (
             f"MoonEP dispatches bf16 activations, got {a1.dtype}."

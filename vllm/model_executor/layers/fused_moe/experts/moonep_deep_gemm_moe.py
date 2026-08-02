@@ -111,8 +111,11 @@ class MoonEPDeepGemmFP4Experts(DeepGemmFP4Experts):
         assert a2_scale is None
         assert self.w1_scale is not None
         assert self.w2_scale is not None
-        assert expert_map is None, (
-            "MoonEP addresses experts globally; expert_map must be None."
+        # m_indices already carry symmetric-buffer rows in the global expert
+        # space, so the global->local expert_map is deliberately unused here.
+        assert expert_map is None or expert_map.numel() == global_num_experts, (
+            f"MoonEP expects global expert ids, but expert_map covers "
+            f"{expert_map.numel()} of {global_num_experts} experts."
         )
 
         a1q = hidden_states
