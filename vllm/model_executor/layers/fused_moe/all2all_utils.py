@@ -284,6 +284,7 @@ def maybe_make_prepare_finalize(
             dp_size=all2all_manager.dp_world_size,
             rank=all2all_manager.rank,
             num_experts=moe.num_experts,
+            num_local_experts=moe.num_local_experts,
             num_topk=moe.experts_per_token,
             max_num_tokens=moe.max_num_tokens,
             token_padding=token_padding,

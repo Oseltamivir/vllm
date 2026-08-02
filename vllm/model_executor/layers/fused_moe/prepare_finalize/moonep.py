@@ -39,6 +39,20 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.utils.math_utils import round_up
+
+# Experts per rank are padded up to a multiple of this in the symmetric weight
+# buffers. DeepGEMM requires tightly packed scale groups
+# (``sf.stride(-3) == sf.stride(-1) * sf.size(-1)``), so the expert extent is
+# what absorbs VMM-granularity alignment rather than the K extent. With a
+# 2 MiB granularity, 128 rows align any tensor whose per-expert size is a
+# multiple of 16 KiB.
+MOONEP_EXPERT_ROW_PAD = 128
+
+
+def moonep_expert_row_pad(num_local_experts: int) -> int:
+    """Rows reserved per rank in the symmetric expert buffers."""
+    return round_up(num_local_experts, MOONEP_EXPERT_ROW_PAD)
 
 
 @triton.jit
@@ -47,13 +61,20 @@ def _moonep_m_indices_kernel(
     slot_experts_ptr,  # [B] int32, global expert id per prefetch slot (-1 empty)
     m_indices_ptr,  # [NvS] int32, written
     num_experts: tl.constexpr,
+    experts_per_rank: tl.constexpr,
+    row_pad: tl.constexpr,
     nvs: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Expand ``cu_seqlens`` into a per-row expert id.
+    """Expand ``cu_seqlens`` into a per-row weight-buffer index.
 
     One program per segment. Rows past the last segment keep the ``-1`` the
     caller pre-filled, which DeepGEMM treats as a block to skip.
+
+    The emitted value is a *row in the symmetric buffer*, not the bare global
+    expert id: each rank's shard occupies ``row_pad`` rows of which only the
+    first ``experts_per_rank`` are real, so global expert ``e`` lives at
+    ``(e // experts_per_rank) * row_pad + e % experts_per_rank``.
     """
     g = tl.program_id(0)
 
@@ -71,19 +92,22 @@ def _moonep_m_indices_kernel(
             other=-1,
         ),
     )
+    row = (expert_id // experts_per_rank) * row_pad + expert_id % experts_per_rank
+    row = tl.where(expert_id < 0, -1, row)
 
     for off in tl.range(start, end, BLOCK):
         idx = off + tl.arange(0, BLOCK)
-        tl.store(m_indices_ptr + idx, expert_id, mask=(idx < end) & (idx < nvs))
+        tl.store(m_indices_ptr + idx, row, mask=(idx < end) & (idx < nvs))
 
 
 def _build_m_indices(
     cu_seqlens: torch.Tensor,
     experts_to_copy_local: torch.Tensor,
     num_experts: int,
+    experts_per_rank: int,
     nvs: int,
 ) -> torch.Tensor:
-    """Build the ``[NvS]`` int32 per-row expert id for DeepGEMM."""
+    """Build the ``[NvS]`` int32 per-row weight-buffer index for DeepGEMM."""
     m_indices = torch.full((nvs,), -1, dtype=torch.int32, device=cu_seqlens.device)
     num_groups = cu_seqlens.numel()
     _moonep_m_indices_kernel[(num_groups,)](
@@ -91,6 +115,8 @@ def _build_m_indices(
         experts_to_copy_local,
         m_indices,
         num_experts=num_experts,
+        experts_per_rank=experts_per_rank,
+        row_pad=moonep_expert_row_pad(experts_per_rank),
         nvs=nvs,
         BLOCK=256,
     )
@@ -122,6 +148,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         dp_size: int,
         rank: int,
         num_experts: int,
+        num_local_experts: int,
         num_topk: int,
         max_num_tokens: int,
         token_padding: int,
@@ -132,6 +159,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.dp_size = dp_size
         self.rank = rank
         self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
         self.num_topk = num_topk
         self.max_num_tokens = max_num_tokens
         self.token_padding = token_padding
@@ -226,6 +254,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             cu_seqlens=cu_seqlens,
             experts_to_copy_local=plan.experts_to_copy[self.rank],
             num_experts=self.num_experts,
+            experts_per_rank=self.num_local_experts,
             nvs=nvs,
         )
 
@@ -243,7 +272,8 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # In dispatched space each row belongs to exactly one expert with
         # exactly one routing weight, so the topk dimension is 1. The experts
-        # kernel reads column 0 as DeepGEMM's m_indices.
+        # kernel reads column 0 as DeepGEMM's m_indices (already mapped to
+        # symmetric-buffer rows, not bare expert ids).
         expert_topk_ids = m_indices.view(nvs, 1)
         expert_topk_weights = route_weights_nvs.view(nvs, 1)
 

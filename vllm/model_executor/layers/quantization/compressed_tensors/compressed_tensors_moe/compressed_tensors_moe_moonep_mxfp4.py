@@ -14,19 +14,18 @@ footprint is unchanged; only the address space is shared.
 
 Two layout constraints drive the code below:
 
-* A VMM chunk must be an exact multiple of the allocation granularity, or
-  ``create_nvl_dist_tensor`` pads dim 0 and global expert ``e`` stops living
-  at row ``e``. The FP4 payloads are exactly aligned at Kimi-K3's shapes; the
-  DeepGEMM-transformed scales are not, so their K extent is padded instead of
-  their expert extent -- that keeps row ``e`` == expert ``e`` at the cost of
-  a slightly larger group stride, which DeepGEMM tolerates because it already
-  consumes these scales strided.
+* A VMM chunk must be an exact multiple of the allocation granularity. The
+  FP4 payloads happen to be exact at Kimi-K3's shapes but the
+  DeepGEMM-transformed scales are not, and DeepGEMM rejects a padded scale
+  group stride outright (``sf.stride(-3) == sf.stride(-1) * sf.size(-1)``).
+  So the *expert* extent absorbs the alignment: each rank reserves
+  ``moonep_expert_row_pad(E/R)`` rows of which the first ``E/R`` are real.
+  Rows stay tightly packed, and the prepare step emits buffer rows rather
+  than bare expert ids so the padding is invisible to the GEMM.
 * DeepGEMM's scale transform is per-expert independent (verified on B300:
   transforming the whole group equals stacking per-expert transforms), which
   is what lets a remote expert's scales be addressed by row at all.
 """
-
-import math
 
 import torch
 import torch.distributed as dist
@@ -45,6 +44,9 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.prepare_finalize.moonep import (
+    moonep_expert_row_pad,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4MoEMethod,
 )
@@ -52,7 +54,6 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_weight_scale_block,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -141,7 +142,8 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         self._symmetric: dict[str, torch.Tensor] = {}
 
     def _own_slice(self, full: torch.Tensor, num_local_experts: int) -> torch.Tensor:
-        lo = self.ep_rank * num_local_experts
+        """This rank's real experts inside its padded row block."""
+        lo = self.ep_rank * moonep_expert_row_pad(num_local_experts)
         return full[lo : lo + num_local_experts]
 
     def create_weights(
@@ -159,13 +161,15 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
 
         rank, world, group = self.ep_rank, self.ep_size, self.ep_device_group
         n13 = 2 * intermediate_size_per_partition
+        # Rows reserved per rank; only the first `num_experts` are real.
+        e_pad = moonep_expert_row_pad(num_experts)
 
         # FP4 payloads: two values per byte along the reduction dim.
         w13_full = _alloc_symmetric_uint8(
-            [num_experts, n13, hidden_size // 2], rank, world, group
+            [e_pad, n13, hidden_size // 2], rank, world, group
         )
         w2_full = _alloc_symmetric_uint8(
-            [num_experts, hidden_size, intermediate_size_per_partition // 2],
+            [e_pad, hidden_size, intermediate_size_per_partition // 2],
             rank,
             world,
             group,
@@ -225,44 +229,36 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         """Copy per-rank transformed scales into a symmetric buffer.
 
         ``local_transformed`` is ``[E_local, mn, k]`` int32 laid out MN-major,
-        i.e. per expert the memory is ``[k, mn]`` contiguous. The K extent is
-        padded up so the per-rank chunk is granularity aligned; the returned
-        view keeps the logical ``[E_global, mn, k]`` shape and only the group
-        stride grows.
+        i.e. per expert the memory is ``[k, mn]`` contiguous. Groups stay
+        tightly packed -- DeepGEMM asserts
+        ``sf.stride(-3) == sf.stride(-1) * sf.size(-1)`` -- so alignment is
+        absorbed by reserving padded expert rows instead.
         """
         e_local, mn, k = local_transformed.shape
         assert local_transformed.dtype == torch.int32
         assert e_local == num_local_experts
 
+        e_pad = moonep_expert_row_pad(e_local)
         gran = _vmm_granularity()
-        # Per-rank bytes = e_local * k_pad * mn * 4 must divide the
-        # granularity; solve for the smallest k_pad >= k.
-        unit = e_local * mn * local_transformed.element_size()
-        step = gran // math.gcd(unit, gran)
-        k_pad = round_up(k, step)
-        assert (e_local * k_pad * mn * 4) % gran == 0
+        per_expert = k * mn * local_transformed.element_size()
+        assert (e_pad * per_expert) % gran == 0, (
+            f"scale chunk {e_pad}x{per_expert} bytes is not a multiple of the "
+            f"{gran}-byte VMM granularity"
+        )
 
         buf = _alloc_symmetric(
-            [e_local, k_pad, mn],
+            [e_pad, k, mn],
             torch.int32,
             self.ep_rank,
             self.ep_size,
             self.ep_device_group,
         )
-        own = self._own_slice(buf, e_local)
         # local_transformed is (mn, k) per expert with stride (1, mn), so its
-        # backing memory is (k, mn); copy that directly.
-        own[:, :k, :].copy_(local_transformed.permute(0, 2, 1))
+        # backing memory is (k, mn); copy that directly into the real rows.
+        self._own_slice(buf, e_local).copy_(local_transformed.permute(0, 2, 1))
 
-        logger.debug_once(
-            "MoonEP scale buffer: k %d -> %d (chunk %d bytes, granularity %d)",
-            k,
-            k_pad,
-            e_local * k_pad * mn * 4,
-            gran,
-        )
-        # Back to the (E_global, mn, k) view DeepGEMM expects.
-        return buf[:, :k, :].permute(0, 2, 1)
+        # (E_pad_global, mn, k) with the tight group stride k*mn DeepGEMM wants.
+        return buf.permute(0, 2, 1)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         num_local_experts = layer.num_experts
