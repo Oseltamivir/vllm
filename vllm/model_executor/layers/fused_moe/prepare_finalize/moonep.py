@@ -157,6 +157,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # weights in dispatched order. MoonEP's combine does not apply them.
         self._plan = None
         self._route_weights_nvs: torch.Tensor | None = None
+        self._num_tokens: int | None = None
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -211,6 +212,23 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert a1.dtype == torch.bfloat16, (
             f"MoonEP dispatches bf16 activations, got {a1.dtype}."
         )
+
+        # MoonEP's Buffer is built for exactly S tokens per rank and dispatch
+        # asserts it receives exactly that many, so pad the batch up to S.
+        # The padding rows carry weight 0, so they contribute nothing to any
+        # real token, and finalize trims the combined output back down. The
+        # fixed shape is also what keeps this path cudagraph-safe.
+        num_tokens = a1.size(0)
+        pad = self.max_num_tokens - num_tokens
+        assert pad >= 0, (
+            f"MoonEP buffer holds {self.max_num_tokens} tokens per rank but "
+            f"got {num_tokens}."
+        )
+        if pad > 0:
+            a1 = torch.nn.functional.pad(a1, (0, 0, 0, pad))
+            topk_ids = torch.nn.functional.pad(topk_ids, (0, 0, 0, pad))
+            topk_weights = torch.nn.functional.pad(topk_weights, (0, 0, 0, pad))
+        self._num_tokens = num_tokens
 
         tokens_per_expert = _local_tokens_per_expert(topk_ids, num_experts)
 
@@ -341,10 +359,12 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             hidden_nvsh=fused_expert_output.contiguous(),
             route_weights_nvs=None,
         )
+        # Trim the padding rows added in prepare.
         output.copy_(combined[: output.size(0)], non_blocking=True)
 
         self._plan = None
         self._route_weights_nvs = None
+        self._num_tokens = None
 
     def finalize(
         self,
