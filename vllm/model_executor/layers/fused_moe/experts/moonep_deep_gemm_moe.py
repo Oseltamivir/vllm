@@ -5,6 +5,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -20,6 +21,8 @@ from vllm.utils.deep_gemm import (
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     mk_alignment_scope,
 )
+
+logger = init_logger(__name__)
 
 
 class MoonEPDeepGemmFP4Experts(DeepGemmFP4Experts):
@@ -60,6 +63,10 @@ class MoonEPDeepGemmFP4Experts(DeepGemmFP4Experts):
         # sizes the MoonEP buffer from the same source, so the two agree by
         # construction.
         self.token_padding = get_mk_alignment_for_contiguous_layout()[0]
+        logger.info_once(
+            "Using MoonEPDeepGemmFP4Experts (token_padding=%d).",
+            self.token_padding,
+        )
 
     def workspace_shapes(
         self,

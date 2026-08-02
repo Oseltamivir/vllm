@@ -153,8 +153,14 @@ def backend_to_kernel_cls(
         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (
             DeepGemmFP4Experts,
         )
+        from vllm.model_executor.layers.fused_moe.experts.moonep_deep_gemm_moe import (
+            MoonEPDeepGemmFP4Experts,
+        )
 
-        return [DeepGemmFP4Experts]
+        # The MoonEP variant only accepts the moonep all2all backend (its
+        # activations arrive already grouped by expert), so it is inert for
+        # every other deployment and DeepGemmFP4Experts remains the default.
+        return [MoonEPDeepGemmFP4Experts, DeepGemmFP4Experts]
 
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,

@@ -284,7 +284,10 @@ class TrtLlmMxfp4ExpertsModular(TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsModula
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return True
+        # This kernel routes and permutes internally from per-token topk ids.
+        # The moonep backend has already dispatched tokens into per-expert
+        # segments by the time the experts run, so the two cannot compose.
+        return not moe_parallel_config.use_moonep_kernels
 
     @staticmethod
     def _supports_routing_method(

@@ -141,6 +141,12 @@ class MoonEPCompressedTensorsMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod)
         # complete. Keyed by the final (post-rename) parameter name.
         self._symmetric: dict[str, torch.Tensor] = {}
 
+        logger.info_once(
+            "Using MoonEP MXFP4 MoE method: expert weights in NVLink "
+            "symmetric memory, DeepGEMM FP8xFP4 grouped GEMM, EP size %d.",
+            self.ep_size,
+        )
+
     def _own_slice(self, full: torch.Tensor, num_local_experts: int) -> torch.Tensor:
         """This rank's real experts inside its padded row block."""
         lo = self.ep_rank * moonep_expert_row_pad(num_local_experts)
