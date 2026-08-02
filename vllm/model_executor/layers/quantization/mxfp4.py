@@ -18,9 +18,6 @@ from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
 )
-from vllm.model_executor.layers.fused_moe.moonep_weights import (
-    MoonEPExpertWeights,
-)
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
@@ -529,7 +526,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.moe_kernel: mk.FusedMoEKernel | None = None
         # MoonEP computes experts it does not own, so its expert weights live
         # in a cross-rank symmetric mapping rather than per-rank tensors.
-        self._moonep_weights: MoonEPExpertWeights | None = None
+        self._moonep_weights = None
         logger.info_once(
             "Mxfp4MoEMethod init: use_moonep_kernels=%s backend=%s use_ep=%s "
             "dp=%d sp=%d ep=%d",
@@ -542,6 +539,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         if moe.use_moonep_kernels:
             from vllm.distributed import get_ep_group
+            from vllm.model_executor.layers.fused_moe.moonep_weights import (
+                MoonEPExpertWeights,
+            )
 
             ep = get_ep_group()
             self._moonep_weights = MoonEPExpertWeights(
