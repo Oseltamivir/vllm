@@ -161,13 +161,22 @@ class MoonEPDeepGemmFP4Experts(DeepGemmFP4Experts):
                 input=mm1_out.view(-1, N), output=quant_out, activation=activation
             )
 
-            # FC2 straight into the output buffer: no unpermute, and the
-            # routing weights and cross-rank reduction are finalize's job.
+            # FC2 must NOT write directly into `output`: the modular kernel
+            # carves both workspace13 and fused_out from one allocation at
+            # offset 0, so `output` aliases the buffer holding a2q. Writing
+            # output row m would clobber a2q rows other CTAs have not read
+            # yet -- silent, schedule-dependent corruption. Land in
+            # workspace2, whose mm1_out is dead by now (the parent reuses it
+            # the same way), then copy out.
+            mm2_out = _resize_cache(workspace2, (M_sum, K))
             m_grouped_fp8_fp4_gemm_nt_contiguous(
                 (a2q, a2q_scale),
                 (w2.view(torch.int8), self.w2_scale),
-                output,
+                mm2_out,
                 expert_ids,
                 recipe_a=(1, self._ACT_BLOCK_K),
                 recipe_b=(1, self._WEIGHT_BLOCK_K),
             )
+
+        # Routing weights and the cross-rank reduction are finalize's job.
+        output.copy_(mm2_out)

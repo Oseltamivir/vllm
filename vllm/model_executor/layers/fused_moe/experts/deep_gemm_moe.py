@@ -455,9 +455,13 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        # moonep needs MoonEPDeepGemmFP4Experts: its activations arrive
+        # already expert-grouped, so this class would re-permute them and
+        # apply the routing weights a second time in its unpermute.
         return not (
             moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
+            or moe_parallel_config.use_moonep_kernels
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

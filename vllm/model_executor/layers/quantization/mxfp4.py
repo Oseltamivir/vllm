@@ -352,18 +352,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        if self._moonep_weights is not None:
-            # vLLM has now transformed this rank's scales into the layout the
-            # backend wants. That transform is per-expert independent, so
-            # publish its output symmetrically and swap the payloads from this
-            # rank's slice to the global mapping -- after this, every expert
-            # row is addressable regardless of which rank owns it.
-            w13, w2, w13_scale, w2_scale = self._moonep_weights.publish_converted(
-                w13_scale=w13_scale,
-                w2_scale=w2_scale,
-                num_local_experts=num_experts,
-            )
-
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
         if self.mxfp4_backend not in TRITON_BACKENDS:
@@ -778,6 +766,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 _cache_permute_indices=self._cache_permute_indices,
             )
         )
+
+        if self._moonep_weights is not None:
+            # vLLM has now transformed this rank's scales into the layout the
+            # backend wants. That transform is per-expert independent, so
+            # publish its output symmetrically and swap the payloads from this
+            # rank's slice to the global mapping -- after this, every expert
+            # row is addressable regardless of which rank owns it.
+            w13, w2, w13_scale, w2_scale = self._moonep_weights.publish_converted(
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                num_local_experts=num_experts,
+            )
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
