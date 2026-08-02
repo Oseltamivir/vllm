@@ -34,6 +34,7 @@ import triton
 import triton.language as tl
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.moonep_weights import (
     expert_row_pad as moonep_expert_row_pad,
@@ -42,6 +43,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -116,15 +119,18 @@ def _local_tokens_per_expert(topk_ids: torch.Tensor, num_experts: int) -> torch.
     """Histogram this rank's (token, k) pairs over the global expert space.
 
     ``torch.bincount`` would synchronize to size its output, so scatter into a
-    pre-sized buffer instead. Negative ids (padded/invalid routing slots) are
-    dropped.
+    pre-sized buffer instead.
+
+    Every id must already be in ``[0, num_experts)`` -- the caller sanitizes.
+    Dropping out-of-range ids here would be actively unsafe: MoonEP's planner
+    needs the histogram to sum to exactly ``S*K`` (its surplus/deficit
+    migration terminates on that conservation invariant), so discarding any
+    entry leaves tokens unallocated.
     """
-    flat = topk_ids.flatten()
-    counts = torch.zeros(num_experts + 1, dtype=torch.int32, device=topk_ids.device)
-    # Fold invalid ids into a trailing bucket that is then discarded.
-    safe = torch.where(flat < 0, num_experts, flat).to(torch.int64)
-    counts.scatter_add_(0, safe, torch.ones_like(safe, dtype=torch.int32))
-    return counts[:num_experts].contiguous()
+    flat = topk_ids.flatten().to(torch.int64)
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
+    return counts.contiguous()
 
 
 class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -158,6 +164,7 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self._plan = None
         self._route_weights_nvs: torch.Tensor | None = None
         self._num_tokens: int | None = None
+        self._checked_invalid = False
 
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
@@ -212,6 +219,12 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         assert a1.dtype == torch.bfloat16, (
             f"MoonEP dispatches bf16 activations, got {a1.dtype}."
         )
+        # FusedMoEKernel.apply defaults global_num_experts to -1; that would
+        # make every id compare invalid below and zero the whole batch.
+        assert num_experts == self.num_experts > 0, (
+            f"MoonEP needs the global expert count, got num_experts="
+            f"{num_experts} against a buffer built for {self.num_experts}."
+        )
 
         # MoonEP's Buffer is built for exactly S tokens per rank and dispatch
         # asserts it receives exactly that many, so pad the batch up to S.
@@ -249,18 +262,40 @@ class MoonEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # any -1 present dies with cudaErrorIllegalAddress. Replace them with
         # real ids spread across the expert space and zero the matching
         # weight, so the slot is inert but addressable.
+        # Applied unconditionally: `if invalid.any()` would be a device->host
+        # sync, which is illegal under cudagraph capture and would defeat the
+        # fixed-shape design above. Worse, if capture happened to run on a
+        # batch with no invalid ids the branch would be baked out and every
+        # replay carrying a -1 would fault again. Two elementwise ops on an
+        # [S, K] int32 tensor are free next to the dispatch.
         invalid = (topk_ids < 0) | (topk_ids >= num_experts)
-        if bool(invalid.any()):
-            filler = (
-                torch.arange(
-                    topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype
+        filler = (
+            torch.arange(topk_ids.numel(), device=topk_ids.device, dtype=topk_ids.dtype)
+            % num_experts
+        ).view_as(topk_ids)
+        topk_ids = torch.where(invalid, filler, topk_ids)
+        topk_weights = torch.where(
+            invalid, torch.zeros_like(topk_weights), topk_weights
+        )
+
+        # A few unassigned slots are normal; a large fraction means topk_ids
+        # are in the wrong space (e.g. already remapped to local ids, which is
+        # mostly -1 under EP). Without this the remap would silently zero most
+        # of the routing weights and yield a plausible but badly wrong output
+        # instead of the loud failure that used to occur. Checked once, and
+        # never while capturing, since it syncs.
+        if not self._checked_invalid and not torch.cuda.is_current_stream_capturing():
+            self._checked_invalid = True
+            frac = float(invalid.float().mean().item())
+            if frac > 0.05:
+                logger.warning(
+                    "MoonEP: %.1f%% of topk_ids were outside [0, %d) and have "
+                    "been remapped with zero weight. A large fraction usually "
+                    "means the ids are not in the global expert space; the "
+                    "MoE output will be scaled down accordingly.",
+                    frac * 100.0,
+                    num_experts,
                 )
-                % num_experts
-            ).view_as(topk_ids)
-            topk_ids = torch.where(invalid, filler, topk_ids)
-            topk_weights = torch.where(
-                invalid, torch.zeros_like(topk_weights), topk_weights
-            )
 
         tokens_per_expert = _local_tokens_per_expert(topk_ids, num_experts)
 
