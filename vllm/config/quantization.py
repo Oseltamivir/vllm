@@ -150,6 +150,17 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     "lut_b": QuantizationConfigArgs(
         linear=QuantSpec(weight=kLutBStatic),
     ),
+    # LUT-B fake quantization on MoE expert weights only; reconstructed
+    # weights are served by the unquantized fused-MoE kernels. Linear layers
+    # stay unquantized (no `linear` field).
+    "lut_b_moe": QuantizationConfigArgs(
+        moe=QuantSpec(weight=kLutBStatic),
+    ),
+    # Weight-only NVFP4 fake quantization on MoE expert weights; the
+    # accuracy-matched comparison arm for `lut_b_moe`.
+    "nvfp4_moe_weight_only": QuantizationConfigArgs(
+        moe=QuantSpec(weight=kNvfp4Static, algorithm="weight_only"),
+    ),
 }
 
 

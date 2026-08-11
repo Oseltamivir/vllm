@@ -13,11 +13,15 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
 )
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
+    ref_nvfp4_quant_dequant,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
@@ -59,6 +63,36 @@ def _quantize_moe_weight_to_nvfp4(
         block_scale.reshape(num_experts, n, k // 16),
         weight_scale_2,
     )
+
+
+class Nvfp4WeightOnlyOnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Weight-only NVFP4 fake quantization for MoE expert weights.
+
+    Quantize-dequantizes each expert to NVFP4 (group-16 E4M3 block scales
+    plus one fp32 global scale per expert, the ModelOpt layout) at load time
+    and serves with the standard unquantized fused-MoE kernels. Activations
+    stay in the model dtype, matching the scope of `LutBOnlineMoEMethod` for
+    weight-only accuracy comparisons.
+    """
+
+    def __init__(self, *, layer: torch.nn.Module) -> None:
+        super().__init__(layer.moe_config)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if not getattr(layer, "_nvfp4_fake_quantized", False):
+            for name in ("w13_weight", "w2_weight"):
+                weight = getattr(layer, name).data
+                assert weight.dim() == 3 and weight.shape[-1] % 16 == 0
+                for expert_weight in weight:
+                    amax = expert_weight.abs().amax().to(torch.float32)
+                    global_scale = (
+                        FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX
+                    ) / amax.clamp_min(1e-8)
+                    expert_weight.copy_(
+                        ref_nvfp4_quant_dequant(expert_weight, global_scale, 16)
+                    )
+            layer._nvfp4_fake_quantized = True
+        super().process_weights_after_loading(layer)
 
 
 class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):

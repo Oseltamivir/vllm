@@ -11,12 +11,80 @@ from vllm.model_executor.kernels.linear.nvfp4.lut_b import (
     quantize_lut_b,
     quantize_lut_b_calibration_free,
 )
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import replace_parameter
+
+
+def _fake_quantize_moe_weight_lut_b(
+    weight: torch.Tensor, algorithm: str | None
+) -> None:
+    """Quantize stacked MoE expert weights ``(E, N, K)`` to LUT-B and
+    reconstruct them in place in the original dtype.
+
+    LUT-B tiles are 8x64 and never cross expert boundaries when the expert
+    dimension is folded into N, so all experts are fit in a single call.
+    """
+    assert weight.dim() == 3, f"expected 3D expert weights, got {weight.shape}"
+    num_experts, n, k = weight.shape
+    if n % LUT_B_BLOCK_N != 0 or k % LUT_B_BLOCK_K != 0:
+        raise ValueError(
+            "LUT-B MoE requires sharded expert weights divisible by "
+            f"({LUT_B_BLOCK_N}, {LUT_B_BLOCK_K}), got ({n}, {k}); adjust "
+            "tensor parallelism so the sharded dims stay divisible"
+        )
+    flat = weight.reshape(num_experts * n, k)
+    if algorithm is None:
+        packed, codebooks = quantize_lut_b(flat)
+        reconstructed = dequantize_lut_b(packed, codebooks, out_dtype=weight.dtype)
+    else:
+        (
+            packed,
+            codebooks,
+            output_scale,
+            residual_position,
+            residual_value,
+        ) = quantize_lut_b_calibration_free(flat, algorithm=algorithm)
+        reconstructed = dequantize_lut_b(
+            packed,
+            codebooks,
+            out_dtype=weight.dtype,
+            output_scale=output_scale,
+            residual_position=residual_position,
+            residual_value=residual_value,
+        )
+    flat.copy_(reconstructed)
+
+
+class LutBOnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online calibration-free LUT-B fake quantization for MoE expert weights.
+
+    Fits LUT-B (3-bit indices into per-8x64-tile E4M3 codebooks) to each
+    expert weight at load time and reconstructs the weights in place in the
+    model dtype. E4M3 codebook entries are exactly representable in bf16, so
+    the reconstructed weights are value-identical to what a Rubin LUT-B MMA
+    would consume, while serving runs the standard unquantized fused-MoE
+    kernels.
+    """
+
+    def __init__(
+        self, *, layer: torch.nn.Module, algorithm: str | None = None
+    ) -> None:
+        super().__init__(layer.moe_config)
+        self.algorithm = algorithm
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_lut_b_fake_quantized", False):
+            _fake_quantize_moe_weight_lut_b(layer.w13_weight.data, self.algorithm)
+            _fake_quantize_moe_weight_lut_b(layer.w2_weight.data, self.algorithm)
+            layer._lut_b_fake_quantized = True
+        super().process_weights_after_loading(layer)
 
 
 class LutBOnlineLinearMethod(LinearMethodBase):

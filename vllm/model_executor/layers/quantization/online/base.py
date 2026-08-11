@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.online.int8 import (
 )
 from vllm.model_executor.layers.quantization.online.lut_b import (
     LutBOnlineLinearMethod,
+    LutBOnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
@@ -45,6 +46,7 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
 )
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
+    Nvfp4WeightOnlyOnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -78,6 +80,7 @@ _ONLINE_MOE_METHODS: dict[QuantKey, type] = {
     kMxfp8Dynamic: Mxfp8OnlineMoEMethod,
     kInt8StaticChannelSym: Int8OnlineMoEMethod,
     kNvfp4Static: Nvfp4OnlineMoEMethod,
+    kLutBStatic: LutBOnlineMoEMethod,
 }
 
 
@@ -150,6 +153,10 @@ class OnlineQuantizationConfig(QuantizationConfig):
             )
         if cls is LutBOnlineLinearMethod:
             return cls(algorithm=spec.algorithm)
+        if cls is LutBOnlineMoEMethod:
+            return cls(layer=layer, algorithm=spec.algorithm)
+        if cls is Nvfp4OnlineMoEMethod and spec.algorithm == "weight_only":
+            return Nvfp4WeightOnlyOnlineMoEMethod(layer=layer)
         if spec.algorithm is not None:
             raise ValueError(
                 f"algorithm={spec.algorithm!r} is not supported for "
